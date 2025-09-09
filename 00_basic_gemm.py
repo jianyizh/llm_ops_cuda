@@ -24,7 +24,8 @@ if __name__ == "__main__":
     # Load the CUDA kernel as a python module
     lib = load(
         name="basic_gemm_lib",
-        sources=["basic_gemm/basic_gemm.cu"],
+        sources=["basic_gemm/basic_gemm.cu",
+                 "basic_gemm/cute_0.cu"],
         extra_cuda_cflags=common_cuda_flags + macros,
         extra_cflags=["-std=c++17"],
         extra_include_paths=[os.path.join(CUTLASS_REPO_PATH, "include")],
@@ -38,4 +39,5 @@ if __name__ == "__main__":
     c = torch.zeros((M, N)).cuda().half().contiguous()
     run_benchmark(partial(torch.matmul, out=c), a, b, tag="f16_torch")
     run_benchmark(lib.basic_gemm, a, b, out=c, tag="cutlass_basic_gemm")
+    run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
     print("-" * 80)
