@@ -33,11 +33,14 @@ if __name__ == "__main__":
     )
 
     print("-" * 80)
-    M, N, K = 1024, 1024, 1024
+    M, N, K = 8192, 4096, 2048
     a = torch.randn((M, K)).cuda().half().contiguous()
-    b = torch.randn((K, N)).cuda().half().contiguous().transpose(0, 1)
+    b = torch.randn((N, K)).cuda().half().contiguous().transpose(0, 1)
     c = torch.zeros((M, N)).cuda().half().contiguous()
     run_benchmark(partial(torch.matmul, out=c), a, b, tag="f16_torch")
+    c_torch = c.cpu()
     run_benchmark(lib.basic_gemm, a, b, out=c, tag="cutlass_basic_gemm")
     run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
+    c_cute = c.cpu()
+    # print(c_torch, c_cute)
     print("-" * 80)

@@ -50,8 +50,8 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   using namespace cute;
 
   // Preconditions
-  CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{}); // (M, N, K)
-  CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{}); // (BLK_M, BLK_N, BLK_K)
+  CUTE_STATIC_ASSERT_V(rank(shape_MNK) == _3{}); // (M, N, K)
+  CUTE_STATIC_ASSERT_V(rank(cta_tiler) == _3{}); // (BLK_M, BLK_N, BLK_K)
 
   CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma)); // NumThreads
   CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma)); // NumThreads
@@ -83,6 +83,8 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   // Get the appropriate blocks for this thread block
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{}); // (BLK_M,BLK_K,k)
+  // gA = gmem_ptr[16b](0x7f90f4000000) o (_128,_64,K / BLK_K):(2048,_1,_64)
+
   Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{}); // (BLK_N,BLK_K,k)
   Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
 
@@ -91,6 +93,9 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   using SharedStorage = SharedStorage<TA, TB, ASmemLayout, BSmemLayout>;
   SharedStorage &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
   Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), sA_layout); // (BLK_M,BLK_K,PIPE)
+  // sA = smem_ptr[16b](0x7f155d000000) o ((_8,_16),((_8,_8),_1),(_1,_3)):((_8,_512),((_1,_64),_0),(_0,_8192))
+  // we also test sA = smem_ptr[16b](0x7f7b8d000000) o (_128,_64,_3):(_64,_1,_8192)
+
   Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), sB_layout); // (BLK_N,BLK_K,PIPE)
 
   //
@@ -98,8 +103,39 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   //
 
   ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
+
+  // Copy_Atom
+  //   ThrID:        _1:_0
+  //   ValLayoutSrc: (_1,_8):(_0,_1)
+  //   ValLayoutDst: (_1,_8):(_0,_1)
+  //   ValLayoutRef: (_1,_8):(_0,_1)
+  //   ValueType:    16b
+  // ThrCopy
+  //   ThrIdx: 0
+  // TiledCopy
+  //   Tiler_MN:       (_16,_64)
+  //   TiledLayout_TV: ((_8,_16),_8):((_128,_1),_16)
+
+
+  // Tiler_MN is the layout of src/dst.
+  // given thread id 10, value id 3, what does it copy?
+  // 1. change coordinates between nature order and 1D order, read from right to left
+  // thread layout (8, 16), thread id 10 = (2, 1), TV layout is ((2, 1), 3)
+  // 2. index value is 2 * 128 + 1 + 3 * 16 = 305. in cute, defult is column major
+  // in MN layout, it's 305 = 1 + 16*19 (1, 19)
+
   Tensor tAgA = thr_copy_a.partition_S(gA); // (CPY,CPY_M,CPY_K,k)
+  // different thread will have different address
+  // tAgA = gmem_ptr[16b](0x7f33f4000000) o ((_8,_1),_8,_1,32):((_1,_0),32768,_0,_64)
+  // each thread loop CPY times, each time copy 8 on M and 1 on K.
+
+
   Tensor tAsA = thr_copy_a.partition_D(sA); // (CPY,CPY_M,CPY_K,PIPE)
+  // tAsA = smem_ptr[16b](0x7f3865000000) o ((_8,_1),_8,_1,(_1,_3)):((_1,_0),_1024,_0,(_0,_8192))
+  // when sA = (_128,_64,_3):(_64,_1,_8192)
+  // tAsA = smem_ptr[16b](0x7f76f9000000) o ((_8,_1),_8,_1,_3):((_1,_0),_1024,_0,_8192)
+  
+    
 
   ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
   Tensor tBgB = thr_copy_b.partition_S(gB); // (CPY,CPY_N,CPY_K,k)
@@ -127,7 +163,7 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   {
     copy(copy_a, tAgA(_, _, _, k_tile_next), tAsA(_, _, _, k_pipe));
     copy(copy_b, tBgB(_, _, _, k_tile_next), tBsB(_, _, _, k_pipe));
-    cp_async_fence();
+    cp_async_fence(); // mark previous cp async in one group
     --k_tile_count;
     if (k_tile_count > 0)
     {
@@ -140,13 +176,32 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   //
 
   ThrMMA thr_mma = mma.get_slice(threadIdx.x);
+  // ThrMMA
+  //   Thr VMNK: (0,0,0,_0)
+  // TiledMMA
+  //   ThrLayoutVMNK:  (_32,_2,_2,_1):(_1,_32,_64,_0)
+  //   PermutationMNK: (_32,_32,_16)
+  // MMA_Atom (hardcode in traits)
+  //   ThrID:      _32:_1
+  //   Shape_MNK:  (_16,_8,_16)
+  //   LayoutA_TV: ((_4,_8),(_2,_2,_2)):((_32,_1),(_16,_8,_128))
+  //   LayoutB_TV: ((_4,_8),(_2,_2)):((_16,_1),(_8,_64))
+  //   LayoutC_TV: ((_4,_8),(_2,_2)):((_32,_1),(_16,_8))
+
   Tensor tCgC = thr_mma.partition_C(gC); // (MMA,MMA_M,MMA_N)
+  // gmem_ptr[16b](0x7f3f88000000) o ((_2,_2),_4,_8):((_1,32768),131072,_16)
 
   // Allocate registers for pipelining
   Tensor tCrA = thr_mma.partition_fragment_A(sA(_, _, 0)); // (MMA,MMA_M,MMA_K)
+  // ptr[16b](0x7f85abfffb60) o ((_2,_2,_2),_4,_4):((_1,_2,_4),_32,_8)
+  // thr_mma.partition_A(sA(_, _, 0)) is smem_ptr[16b](0x7f7109000000) o ((_2,_2,_2),_4,_4):((_1,_512,_8),_2048,_16)
+
   Tensor tCrB = thr_mma.partition_fragment_B(sB(_, _, 0)); // (MMA,MMA_N,MMA_K)
+  // ptr[16b](0x7f8c0bfffb60) o ((_2,_2),_8,_4):((_1,_2),_16,_4)
+
   // Allocate the accumulators -- same size as the projected data
   Tensor tCrC = thr_mma.make_fragment_C(tCgC); // (MMA,MMA_M,MMA_N)
+  // ptr[16b](0x7fb03ffffb60) o ((_2,_2),_4,_8):((_1,_2),_4,_16)
 
   CUTE_STATIC_ASSERT_V((shape(tCrC) == take<0, 3>(shape(tCgC)))); // (MMA,MMA_M,MMA_N)
   CUTE_STATIC_ASSERT_V((size<1>(tCgC) == size<1>(tCrA)));         // MMA_M
@@ -161,8 +216,26 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
 
   TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma);
   ThrCopy s2r_thr_copy_a = s2r_copy_a.get_slice(threadIdx.x);
+  
+
+  // ThrCopy
+  //   ThrIdx: 0
+  // TiledCopy
+  //   Tiler_MN:       (_32,_16)
+  //   TiledLayout_TV: ((_4,_8,_2,_2),((_2,_2,_2),(_1,_1))):((_64,_1,_16,_0),((_32,_8,_256),(_0,_0)))
+  // Copy_Atom
+  //   ThrID:        _32:_1
+  //   ValLayoutSrc: (_32,_8):(_8,_1)
+  //   ValLayoutDst: (_32,(_2,_4)):(_2,(_1,_64))
+  //   ValLayoutRef: (_32,(_2,_4)):(_2,(_1,_64))
+  //   ValueType:    16b
+
   Tensor tXsA = s2r_thr_copy_a.partition_S(sA); // (CPY,MMA_M,MMA_K,PIPE)
+  // smem_ptr[16b](0x7f0471000000) o ((_8,_1),_4,_4,(_1,_3)):((_1,_0),_2048,_128,(_0,_8192))
+  // if sA is (128, 64, 3) smem_ptr[16b](0x7f8a61000000) o ((_8,_1),_4,_4,_3):((_1,_0),_2048,_16,_8192)
+  
   Tensor tXrA = s2r_thr_copy_a.retile_D(tCrA);  // (CPY,MMA_M,MMA_K)
+  // ptr[16b](0x7f6223fffb60) o ((_8,_1),_4,_4):((_1,_0),_32,_8)
 
   TiledCopy s2r_copy_b = make_tiled_copy_B(s2r_atom_b, mma);
   ThrCopy s2r_thr_copy_b = s2r_copy_b.get_slice(threadIdx.x);
@@ -176,18 +249,19 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
 
   // Pipe slice
   Tensor tXsA_p = tXsA(_, _, _, smem_pipe_read);
+  // smem_ptr[16b](0x7fe771000000) o ((_8,_1),_4,_4):((_1,_0),_2048,_128)
   Tensor tXsB_p = tXsB(_, _, _, smem_pipe_read);
 
   // Size of the register pipeline
-  auto K_BLOCK_MAX = size<2>(tCrA);
+  auto K_BLOCK_MAX = size<2>(tCrA); // MMA_K = 4
   CUTE_STATIC_ASSERT_V(K_BLOCK_MAX == size<2>(tXrA));
 
   // PREFETCH register pipeline
   if (K_BLOCK_MAX > 1)
   {
     // Wait until our first prefetched tile is loaded in
-    cp_async_wait<K_PIPE_MAX - 2>();
-    __syncthreads();
+    cp_async_wait<K_PIPE_MAX - 2>(); // this warp has finished K_PIPE_MAX - 2 cp async groups
+    __syncthreads(); // other warps will use this data, need sync
 
     // Prefetch the first rmem from the first k-tile
     copy(s2r_atom_a, tXsA_p(_, _, Int<0>{}), tXrA(_, _, Int<0>{}));
@@ -276,44 +350,67 @@ cudaError_t cute_example_gemm(
   using TA = cute::half_t;
   using TB = cute::half_t;
   using TC = cute::half_t;
-  using TI = cute::half_t;
+  using TI = float;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto prob_shape = make_shape(M, N, K); // (M, N, K)
 
   // Define TN strides (mixed)
-  auto dA = make_stride(lda, Int<1>{}); // (dM, dK)
-  auto dB = make_stride(ldb, Int<1>{}); // (dN, dK)
-  auto dC = make_stride(ldc, Int<1>{}); // (dM, dN)
+  auto dA = make_stride(lda, _1{}); // (dM, dK) row major
+  // note B is column major in pyorch, here ldb = K is not changed，
+  // shape B is always (N, K) in cutlass gemm api
+  auto dB = make_stride(ldb, _1{}); // (dN, dK) row major
+  auto dC = make_stride(ldc, _1{}); // (dM, dN) row major
 
   // Define CTA tile sizes (static)
-  auto bM = Int<128>{};
-  auto bN = Int<128>{};
-  auto bK = Int<64>{};
+  // thread_block tile size
+  auto bM = _128{};
+  auto bN = _128{};
+  auto bK = _64{};
   auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M, BLK_N, BLK_K)
-  auto bP = Int<3>{};                      // Pipeline
+  auto bP = _3{};                          // Pipeline
 
   // Define the smem layouts (static)
   // Swizzles for LDSM and 128b k-major loads
-  auto swizzle_atom = composition(Swizzle<3, 3, 3>{},
-                                  Layout<Shape<_8, Shape<_8, _8>>,
-                                         Stride<_8, Stride<_1, _64>>>{});
+  // TODO: we will enable swizzle in next examples
+  // auto swizzle_atom = composition(Swizzle<3, 3, 3>{},
+  //                                 Layout<Shape<_8, Shape<_8, _8>>,
+  //                                        Stride<_8, Stride<_1, _64>>>{});
 
-  auto sA = tile_to_shape(swizzle_atom, make_shape(bM, bK, bP));
-  auto sB = tile_to_shape(swizzle_atom, make_shape(bN, bK, bP));
+  // auto sA = tile_to_shape(swizzle_atom, make_shape(bM, bK, bP));
+  // auto sB = tile_to_shape(swizzle_atom, make_shape(bN, bK, bP));
+  // shared memory layout without swizzle
+  // tile_to_shape means? <_8, Shape<_8, _8>> tile repeat <bM/8, bK/<8,8>, bP> to get target shape (bM, bK, bP)
+  // sA has shape ((8, bM/8)， ((8,8), bK/(8*8)), (1, bP)): ((_8,_512),((_1,_64),_0),(_0,_8192))
+  // coalesce(Layout<Shape<_8, Shape<_8, _8>>,Stride<_8, Stride<_1, _64>>>()) = (_8,_8,_8):(_8,_1,_64), k major
+  
+  // coalesce(sA) =  (8, bM/8，8, 8, bK/64, bP):(_8,_512,_1,_64,bM * 64)
+  // auto sA = tile_to_shape(Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{}, make_shape(bM, bK, bP));
+  // if we donnot use swizzle, this layout can be replaced.
+  // tile_to_shape(Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{}, make_shape(bM, bK, bP)) 
+  // We can use any simpler layout with K major (8 element contiguous on k to becompatible with vectorized copy op)
+  // TODO: need understand why different layout leads to different performance
+  // auto sA = tile_to_shape(Layout<Shape<_8, _64>, Stride<_64, _1>>{}, make_shape(bM, bK, bP));
+  auto sA = Layout<Shape<_128, _64, _3>, Stride<_64, _1, Int<128*64>>>{};
+  // auto sB = tile_to_shape(Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{}, make_shape(bN, bK, bP));
+  auto sB = Layout<Shape<_128, _64, _3>, Stride<_64, _1, Int<128*64>>>{};
   auto sC = make_layout(make_shape(bM, bN));
 
   // Define the thread layouts (static)
-
+  // 128 threads. 8 element per thread
   TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, cute::half_t>{},
                                     Layout<Shape<_16, _8>, Stride<_8, _1>>{}, // Thr layout 16x8 k-major
                                     Layout<Shape<_1, _8>>{});                 // Val layout  1x8 k-major
   TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, cute::half_t>{},
                                     Layout<Shape<_16, _8>, Stride<_8, _1>>{}, // Thr layout 16x8 k-major
                                     Layout<Shape<_1, _8>>{});                 // Val layout  1x8 n-major
+  // print_latex(copyB);
 
+  // 2x2x1 means do 2mma on M, 2mma on N, 1mma on K, so need 4 warps, so block size = size(mmaC) = 4 * 32
+  // 32x32x16 is the actual mma size
   TiledMMA mmaC = make_tiled_mma(SM80_16x8x16_F16F16F16F16_TN{},
                                  Layout<Shape<_2, _2>>{}, // 2x2x1 MMA Atoms
                                  Tile<_32, _32, _16>{});  // 32x32x16 Tiled MMA for LDSM
+                                 
 
   // Copy_Atom<DefaultCopy, half_t> s2r_atom_A;
   // Copy_Atom<UniversalCopy<half_t>, half_t> s2r_atom_A;
@@ -379,14 +476,6 @@ cudaError_t cute_example_gemm(
   //                                                                cute::AutoVectorizingCopyWithAssumedAlignment<128>,
   //                                                                cute::identity>;
 
-  // if (status != cutlass::Status::kSuccess)
-  // {
-  //   cutlass::Status error = status;
-  //   std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << std::endl;
-  //   return cudaErrorUnknown;
-  // }
-
-  // // Return success, if no errors were encountered.
   return cudaSuccess;
 }
 
