@@ -11,10 +11,12 @@ common_cuda_flags = ["-O3",
                      "--expt-relaxed-constexpr",
                      "--expt-extended-lambda",
                      "--use_fast_math",]
+common_sycl_flags = ["-O3"]
 
 
 def flush_cache():
-    torch.sum(torch.randn(1024, 1024, 256).to("cuda"))
+    torch.sum(torch.randn(1024, 1024, 256,
+              device=torch.accelerator.current_accelerator()))
 
 
 def run_benchmark(
@@ -42,19 +44,19 @@ def run_benchmark(
         for i in range(iters):
             out.fill_(0)
             flush_cache()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.time()
             perf_func(*args, out)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             end = time.time()
             total_time += (end - start)
     else:
         for i in range(iters):
             flush_cache()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.time()
             out = perf_func(*args)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             end = time.time()
             total_time += (end - start)
     total_time *= 1000  # ms

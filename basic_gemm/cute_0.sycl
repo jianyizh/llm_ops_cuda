@@ -1,0 +1,277 @@
+#include <algorithm>
+#include <float.h>
+#include <iostream>
+#include <torch/extension.h>
+#include <torch/types.h>
+#include <ATen/xpu/XPUContext.h>
+#include <vector>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+
+#include <cute/tensor.hpp>
+#include "cutlass/kernel_hardware_info.h"
+#include "cutlass/platform/platform.h"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/util/sycl_event_manager.hpp"
+#include "cutlass/util/GPU_Clock.hpp"
+#include "cutlass/util/reference/device/gemm_complex.h"
+#include "cutlass/util/reference/device/tensor_compare.h"
+#include "cutlass/util/reference/host/tensor_fill.h"
+#include "cutlass/fast_math.h"
+
+#include <sycl/sycl.hpp>
+
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+using namespace cute;
+
+template <class ATensor, class BTensor, class CTensor,
+          class TiledMMA>
+void cute_gemm_device(ATensor const &A, // (M,K)
+                      BTensor const &B, // (N,K)
+                      CTensor &C,       // (M,N)
+                      TiledMMA const &mma)
+{
+  // -----
+  // Setup
+  // -----
+
+  /* Get workgroup and local IDs */
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
+  auto wg_m = int(item.get_group(1));
+  auto wg_n = int(item.get_group(0));
+  auto local_id = int(item.get_local_id(0));
+
+  /* Create proxy coordinate tensors for each global tensor */
+  Tensor cA = make_identity_tensor(A.shape()); // (M,K)
+  Tensor cB = make_identity_tensor(B.shape()); // (N,K)
+  Tensor cC = make_identity_tensor(C.shape()); // (M,N)
+
+  /* Split GEMM into workgroup tiles, and identify our workgroup's tile (wg_coord) */
+  auto wg_tile = mma.tile_mnk();
+  auto wg_coord = make_coord(wg_m, wg_n, 0);
+
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _)); // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _)); // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{});       // (BLK_M,BLK_N)
+
+  /* Create block 2D TiledCopies */
+  auto copy_a = make_block_2d_copy_A(mma, A);
+  auto copy_b = make_block_2d_copy_B(mma, B);
+  auto copy_c = make_block_2d_copy_C(mma, C);
+
+  /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_a = copy_a.get_slice(local_id);
+  auto thr_copy_b = copy_b.get_slice(local_id);
+
+  /* Register fragments for MMA */
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  /* Register fragments for copies */
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  /* Partition global tensor (proxies) for copies */
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  /* Partition C */
+  Tensor tCrC = partition_fragment_C(mma, select<0, 1>(wg_tile));
+  cute::array<cute::half_t, decltype(size(tCrC))::value> tmp_storage;
+  auto tCrC_half = make_tensor(make_rmem_ptr(tmp_storage.data()), tCrC.shape());
+
+  Tensor tCgC = thr_mma.partition_C(gC); /* also matches copy_c's source layout */
+
+  /* Create prefetch TiledCopy instances */
+  auto prefetch_a = make_block_2d_prefetch(copy_a);
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+  auto thr_prefetch_A = prefetch_a.get_slice(local_id);
+  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
+
+  /* Partition global tensor (proxies) for prefetch */
+  auto pAgA = thr_prefetch_A.partition_S(gA);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  /* Prefetch distance, in units of k tiles */
+  const int prefetch_dist = 3;
+
+  // ------
+  // Kernel
+  // ------
+
+  constexpr int barrier_scope = 2;
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  /* Clear the accumulators */
+  clear(tCrC);
+
+  /* Warm up loops with prefetch to L1 */
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++)
+  {
+    prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+  }
+
+  /* Main loop */
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++)
+  {
+    /* Split barrier keeping threads loosely together */
+    barrier_arrive(barrier_scope);
+
+    /* Copy A/B from global memory (ideally L1 cache) to registers */
+    copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+    /* Prefetch A/B tiles to L1 */
+    prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+
+    /* Shuffle data from copy fragments to MMA fragments */
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+
+    /* Accumulate C += A * B */
+    gemm(mma, tCrA, tCrB, tCrC);
+
+    /* Other half of split barrier */
+    barrier_wait(barrier_scope);
+  }
+
+  CUTE_UNROLL
+  for (int i = 0; i < size(tCrC); ++i)
+  {
+    tCrC_half(i) = static_cast<cute::half_t>(tCrC(i));
+  }
+  // axpby(1.0f, tCrC, 0.0f, tCgC); why it fail?
+  /* Write C to global memory */
+  copy(copy_c, tCrC_half, tCgC);
+}
+
+template <typename T, size_t = 0>
+struct is_complete : std::false_type
+{
+};
+
+template <typename T>
+struct is_complete<T, 0 * sizeof(T)> : std::true_type
+{
+};
+
+template <typename T>
+static constexpr bool is_complete_v = is_complete<T>::value;
+
+template <typename TA, typename TB, typename TC>
+auto choose_mma_op()
+{
+  if constexpr (is_complete_v<XE_DPAS_TT<8, TC, TA, TB>>)
+    return XE_DPAS_TT<8, TC, TA, TB>{};
+  else if constexpr (is_same_v<TA, cute::bfloat16_t>)
+    return XE_DPAS_TT<8, float, cute::bfloat16_t>{};
+  else /* Use f16 by default as upconversion sequences are typically faster */
+    return XE_DPAS_TT<8, float, cute::half_t>{};
+}
+
+template <class ATensor, class BTensor, class CTensor>
+auto choose_tiled_mma(ATensor const &A, BTensor const &B, CTensor const &)
+{
+  using TA = typename ATensor::element_type;
+  using TB = typename BTensor::element_type;
+  using TC = typename CTensor::element_type;
+
+  auto op = choose_mma_op<TA, TB, TC>();
+
+  constexpr bool byte = (cute::max(sizeof_bits_v<TA>, sizeof_bits_v<TB>) <= 8);
+  constexpr bool use_1x_dpas_per_k = is_constant_v<1, decltype(stride<0>(A))>               // Use one DPAS in k dimension for A^T case
+                                     || (byte && is_constant_v<1, decltype(stride<0>(B))>); //  pending compiler improvements (also int8 B^N)
+
+  using _K = conditional_t<use_1x_dpas_per_k,
+                           C<op.K>, C<op.K * 2>>;
+
+  using WGTile = Shape<_256, _256, _K>;                           // 256x256 WG tile size
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>; // 8x4 SG tiling, n-major
+
+  using MMA = typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTile>, SGLayout>::TiledMMA;
+
+  return MMA{};
+}
+
+class GemmCuteName;
+
+cutlass::Status cute_example_gemm(
+    int M,
+    int N,
+    int K,
+    float alpha,
+    cute::half_t const *A,
+    int lda,
+    cute::half_t const *B,
+    int ldb,
+    float beta,
+    cute::half_t *C,
+    int ldc,
+    torch::Device device)
+{
+  using TA = cute::half_t;
+  using TB = cute::half_t;
+  using TC = cute::half_t;
+  auto queue = at::xpu::getCurrentXPUStream().queue();
+
+  // Define TN strides (mixed)
+  auto dA = make_stride(lda, _1{}); // (dM, dK) row major
+  // note B is column major in pyorch, here ldb = K is not changed，
+  // shape B is always (N, K) in cutlass gemm api
+  auto dB = make_stride(ldb, _1{}); // (dN, dK) row major
+  auto dC = make_stride(ldc, _1{}); // (dM, dN) row major
+
+  auto TensorA = make_tensor(make_gmem_ptr(A), make_layout(make_shape(M, K), dA));
+  auto TensorB = make_tensor(make_gmem_ptr(B), make_layout(make_shape(N, K), dB));
+  auto TensorC = make_tensor(make_gmem_ptr(C), make_layout(make_shape(M, N), dC));
+
+  auto mma = choose_tiled_mma(TensorA, TensorB, TensorC);
+  sycl::range<2> local = {size(mma), 1};
+  sycl::range<2> global = {local[0] * ceil_div(shape<0>(TensorB), get<1>(mma.tile_mnk())),
+                           local[1] * ceil_div(shape<0>(TensorA), get<0>(mma.tile_mnk()))};
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+
+  syclex::properties kernel_props{
+      syclex::sub_group_size<16>,
+      intelex::grf_size<256>};
+
+  auto event = queue.parallel_for<GemmCuteName>(sycl::nd_range<2>(global, local), kernel_props,
+                                                [=](auto)
+                                                {
+                                                  cute_gemm_device(TensorA, TensorB, TensorC, mma);
+                                                });
+
+  queue.wait_and_throw();
+  return cutlass::Status::kSuccess;
+}
+
+#define STRINGFY(str) #str
+#define TORCH_BINDING_COMMON_EXTENSION(func) \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
+
+void cute_example(torch::Tensor &a, torch::Tensor &b, torch::Tensor &c)
+{
+  const int M = a.size(0);
+  const int K = a.size(1);
+  const int N = b.size(1);
+  const int lda = K;
+  const int ldb = K;
+  const int ldc = N;
+  auto result = cute_example_gemm(M, N, K, 1., reinterpret_cast<cute::half_t *>(a.data_ptr()), lda, reinterpret_cast<cute::half_t *>(b.data_ptr()), ldb, 0., reinterpret_cast<cute::half_t *>(c.data_ptr()), ldc, a.device());
+  if (result != cutlass::Status::kSuccess)
+  {
+    std::cerr << "CUTLASS GEMM kernel failed: "
+              << cutlassGetStatusString(result) << std::endl;
+  }
+}
