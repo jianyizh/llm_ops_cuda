@@ -453,9 +453,9 @@ cudaError_t cute_example_gemm(
       kernel_fptr,
       cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-  cudaFuncSetAttribute(
-      kernel_fptr,
-      cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  // cudaFuncSetAttribute(
+  //     kernel_fptr,
+  //     cudaFuncAttributePreferredSharedMemoryCarveout, 100);
 
   kernel_fptr<<<dimGrid, dimBlock, smem_size, stream>>>(prob_shape, cta_tiler,
                                                         A, dA, sA, copyA, s2r_atom_A,
