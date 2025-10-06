@@ -4,11 +4,10 @@ from typing import Optional, Any
 
 
 common_cuda_flags = ["-O3",
-                     "-U__CUDA_NO_HALF_OPERATORS__",
-                     "-U__CUDA_NO_HALF_CONVERSIONS__",
-                     "-U__CUDA_NO_HALF2_OPERATORS__",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--expt-relaxed-constexpr",
+                     "-ftemplate-backtrace-limit=0",
+                     "-Xcompiler=-Wconversion",
+                     "-Xcompiler=-fno-strict-aliasing",
                      "--expt-extended-lambda",
                      "--use_fast_math",]
 common_sycl_flags = ["-O3"]

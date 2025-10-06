@@ -23,8 +23,10 @@ if __name__ == "__main__":
     )
 
     macros = [
+        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
         f"-DTORCH_CURRENT_DEVICE=cutlass::arch::Sm{SM}",
         f"-gencode=arch=compute_{SM},code=sm_{SM}",
+        # "-g -lineinfo"
     ] if device == "cuda" else ["-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET"]
 
     # Load the CUDA kernel as a python module
@@ -37,8 +39,8 @@ if __name__ == "__main__":
             extra_cflags=["-std=c++17"] + macros,
             extra_include_paths=[os.path.join(
                 CUTLASS_REPO_PATH, "include"), "./third_party/cutlass-sycl/tools/util/include"],
-            #extra_ldflags=["-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier"],
-            # I have add sycl_dlink_post_cflags += ['-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier']
+            # extra_ldflags=["-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier"],
+            # I have to add sycl_dlink_post_cflags += ['-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier'] and remove spir64 from -fsycl-targets
             verbose=True,
         )
     else:
@@ -55,6 +57,8 @@ if __name__ == "__main__":
     print("-" * 80)
     M, N, K = 8192, 4096, 2048
     if device == "cuda":
+        # a_tile = torch.arange(128*64).reshape(128, 64).half().cuda()/100.
+        # a = a_tile.repeat(M//128, K//64)
         a = torch.randn((M, K)).cuda().half().contiguous()
         b = torch.randn((N, K)).cuda().half().contiguous().transpose(0, 1)
         c = torch.zeros((M, N)).cuda().half().contiguous()
@@ -63,6 +67,7 @@ if __name__ == "__main__":
         run_benchmark(lib.basic_gemm, a, b, out=c, tag="cutlass_basic_gemm")
         run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
         c_cute = c.cpu()
+        print((c_cute - c_torch).sum())
     if device == "xpu":
         a = torch.randn((M, K)).xpu().half().contiguous()
         b = torch.randn((N, K)).xpu().half().contiguous().transpose(0, 1)

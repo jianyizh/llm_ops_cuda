@@ -80,8 +80,7 @@ void cute_gemm_device(ATensor const &A, // (M,K)
 
   /* Partition C */
   Tensor tCrC = partition_fragment_C(mma, select<0, 1>(wg_tile));
-  cute::array<cute::half_t, decltype(size(tCrC))::value> tmp_storage;
-  auto tCrC_half = make_tensor(make_rmem_ptr(tmp_storage.data()), tCrC.shape());
+  auto tCrC_half = make_tensor_like<half_t>(tCrC);
 
   Tensor tCgC = thr_mma.partition_C(gC); /* also matches copy_c's source layout */
 

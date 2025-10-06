@@ -3,4 +3,4 @@
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "third_party/cutlass-sycl"]
 	path = third_party/cutlass-sycl
-	url = https://github.com/intel/cutlass-sycl.git
+	url = https://github.com/intel/sycl-tla.git

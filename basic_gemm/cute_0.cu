@@ -40,12 +40,12 @@ struct SharedStorage
 template <class ProblemShape, class CtaTiler,
           class TA, class AStride, class ASmemLayout, class TiledCopyA, class S2RAtomA,
           class TB, class BStride, class BSmemLayout, class TiledCopyB, class S2RAtomB,
-          class TC, class CStride, class CSmemLayout, class TiledMma,
+          class TC, class CStride, class CSmemLayout, class TiledStoreC, class R2SAtomC, class TiledMma,
           class Alpha, class Beta, class Swizzle>
 __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute_gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
                                                                                              TA const *A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
                                                                                              TB const *B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b, S2RAtomB s2r_atom_b,
-                                                                                             TC *C, CStride dC, CSmemLayout, TiledMma mma,
+                                                                                             TC *C, CStride dC, CSmemLayout sC_layout, TiledStoreC store_c, R2SAtomC r2s_atom_c, TiledMma mma,
                                                                                              Alpha alpha, Beta beta, Swizzle swizzle)
 {
   using namespace cute;
@@ -82,8 +82,8 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   Tensor mC = make_tensor(make_gmem_ptr(C), select<0, 1>(shape_MNK), dC); // (M,N)
 
   // Get the appropriate blocks for this thread block
-  auto swizzle_coord = swizzle.get_tile_offset(swizzle.get_tiled_shape({8192,4096,2048},{128,128,64},1));
-  auto cta_coord = make_coord(swizzle_coord.m(),swizzle_coord.n(),_);
+  auto swizzle_coord = swizzle.get_tile_offset(swizzle.get_tiled_shape({get<0>(shape_MNK), get<1>(shape_MNK), get<2>(shape_MNK)}, {size<0>(cta_tiler), size<1>(cta_tiler), size<2>(cta_tiler)}, 1));
+  auto cta_coord = make_coord(swizzle_coord.m(), swizzle_coord.n(), _);
   // auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{}); // (BLK_M,BLK_K,k)
   // gA = gmem_ptr[16b](0x7f90f4000000) o (_128,_64,K / BLK_K):(2048,_1,_64)
@@ -343,7 +343,33 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   // Epilogue
   //
 
-  axpby(alpha, tCrC, beta, tCgC);
+  // axpby(alpha, tCrC, beta, tCgC);
+  // if add build option "-U__CUDA_NO_HALF_OPERATORS__",
+  //                     "-U__CUDA_NO_HALF_CONVERSIONS__",
+  //                     "-U__CUDA_NO_HALF2_OPERATORS__",
+  //                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+  // we can use axpby or tCrC_fp16(i) = tCrC(i) without cast 
+  Tensor tCrC_fp16 = make_tensor_like<half_t>(tCrC);
+  CUTE_UNROLL
+  for (int i = 0; i < size(tCrC); i++)
+  {
+    tCrC_fp16(i) = static_cast<half_t>(tCrC(i));
+  }
+
+  Tensor sC = make_tensor(make_smem_ptr(smem.A.begin()), sC_layout);
+  TiledCopy copy_c = make_tiled_copy_C(r2s_atom_c, mma);
+  ThrCopy thr_copy_c = copy_c.get_slice(threadIdx.x);
+  Tensor tSrC_r2s = thr_copy_c.retile_S(tCrC_fp16);
+  Tensor tSsC_r2s = thr_copy_c.partition_D(sC);
+  copy(copy_c, tSrC_r2s, tSsC_r2s);
+
+  __syncthreads();
+
+  auto s2g_thr_store = store_c.get_slice(threadIdx.x);
+
+  Tensor tSsC = s2g_thr_store.partition_S(sC);
+  Tensor tSgC = s2g_thr_store.partition_D(gC);
+  copy(store_c, tSsC, tSgC);
 }
 
 cudaError_t cute_example_gemm(
@@ -409,7 +435,8 @@ cudaError_t cute_example_gemm(
   auto sB = tile_to_shape(swizzle_atom, make_shape(bN, bK, bP));
   // auto sB = tile_to_shape(Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{}, make_shape(bN, bK, bP));
   // auto sB = Layout<Shape<_128, _64, _3>, Stride<_64, _1, Int<128*64>>>{};
-  auto sC = make_layout(make_shape(bM, bN));
+  auto sC = composition(Swizzle<3, 3, 3>{}, make_layout(make_shape(bM, bN), make_stride(bN, _1{})));
+  // make_layout(make_shape(bM, bN), make_stride(bN, _1{})); // TODO: find a layout without bank conflict during store
 
   // Define the thread layouts (static)
   // 128 threads. 8 element per thread
@@ -419,6 +446,9 @@ cudaError_t cute_example_gemm(
   TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, cute::half_t>{},
                                     Layout<Shape<_16, _8>, Stride<_8, _1>>{}, // Thr layout 16x8 k-major
                                     Layout<Shape<_1, _8>>{});                 // Val layout  1x8 n-major
+  TiledCopy storeC = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, cute::half_t>{},
+                                     Layout<Shape<_8, _16>, Stride<_16, _1>>{},
+                                     Layout<Shape<_1, _8>>{});
 
   // 2x2x1 means do 2mma on M, 2mma on N, 1mma on K, so need 4 warps, so block size = size(mmaC) = 4 * 32
   // 32x32x16 is the actual mma size
@@ -439,19 +469,21 @@ cudaError_t cute_example_gemm(
   // Copy_Atom<SM75_U32x2_LDSM_N, half_t> s2r_atom_B;
   Copy_Atom<SM75_U32x4_LDSM_N, half_t> s2r_atom_B;
 
+  Copy_Atom<UniversalCopy<int>, half_t> r2s_atom_C;
+
   int smem_size = int(sizeof(SharedStorage<cute::half_t, cute::half_t, decltype(sA), decltype(sB)>));
   cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8> threadblock_swizzle;
   dim3 dimBlock(size(mmaC));
   // dim3 dimGrid(size(ceil_div(M, bM)),
   //              size(ceil_div(N, bN)));
-  cutlass::gemm::GemmCoord grid_tiled_shape = threadblock_swizzle.get_tiled_shape({M, N, K},{bM, bN, bK}, 1); 
+  cutlass::gemm::GemmCoord grid_tiled_shape = threadblock_swizzle.get_tiled_shape({M, N, K}, {bM, bN, bK}, 1);
   dim3 dimGrid = threadblock_swizzle.get_grid_shape(grid_tiled_shape);
 
   auto kernel_fptr = cute_gemm_device<
       decltype(prob_shape), decltype(cta_tiler),
       cute::half_t, decltype(dA), decltype(sA), decltype(copyA), decltype(s2r_atom_A),
       cute::half_t, decltype(dB), decltype(sB), decltype(copyB), decltype(s2r_atom_B),
-      cute::half_t, decltype(dC), decltype(sC), decltype(mmaC),
+      cute::half_t, decltype(dC), decltype(sC), decltype(storeC), decltype(r2s_atom_C), decltype(mmaC),
       decltype(alpha), decltype(beta), decltype(threadblock_swizzle)>;
 
   // Set L1 to be SMEM only
@@ -466,7 +498,7 @@ cudaError_t cute_example_gemm(
   kernel_fptr<<<dimGrid, dimBlock, smem_size, stream>>>(prob_shape, cta_tiler,
                                                         A, dA, sA, copyA, s2r_atom_A,
                                                         B, dB, sB, copyB, s2r_atom_B,
-                                                        C, dC, sC, mmaC,
+                                                        C, dC, sC, storeC, r2s_atom_C, mmaC,
                                                         alpha, beta, threadblock_swizzle);
 
   return cudaSuccess;
