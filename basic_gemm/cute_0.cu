@@ -21,6 +21,7 @@
 #include <cutlass/epilogue/collective/sm70_epilogue_vectorized.hpp>
 #include <cutlass/epilogue/collective/default_epilogue.hpp>
 #include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle.h>
 
 #ifndef TORCH_CURRENT_DEVICE
 #define TORCH_CURRENT_DEVICE cutlass::arch::Sm80
@@ -40,12 +41,12 @@ template <class ProblemShape, class CtaTiler,
           class TA, class AStride, class ASmemLayout, class TiledCopyA, class S2RAtomA,
           class TB, class BStride, class BSmemLayout, class TiledCopyB, class S2RAtomB,
           class TC, class CStride, class CSmemLayout, class TiledMma,
-          class Alpha, class Beta>
+          class Alpha, class Beta, class Swizzle>
 __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute_gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
                                                                                              TA const *A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
                                                                                              TB const *B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b, S2RAtomB s2r_atom_b,
                                                                                              TC *C, CStride dC, CSmemLayout, TiledMma mma,
-                                                                                             Alpha alpha, Beta beta)
+                                                                                             Alpha alpha, Beta beta, Swizzle swizzle)
 {
   using namespace cute;
 
@@ -81,7 +82,9 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void cute
   Tensor mC = make_tensor(make_gmem_ptr(C), select<0, 1>(shape_MNK), dC); // (M,N)
 
   // Get the appropriate blocks for this thread block
-  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
+  auto swizzle_coord = swizzle.get_tile_offset(swizzle.get_tiled_shape({8192,4096,2048},{128,128,64},1));
+  auto cta_coord = make_coord(swizzle_coord.m(),swizzle_coord.n(),_);
+  // auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{}); // (BLK_M,BLK_K,k)
   // gA = gmem_ptr[16b](0x7f90f4000000) o (_128,_64,K / BLK_K):(2048,_1,_64)
 
@@ -437,16 +440,19 @@ cudaError_t cute_example_gemm(
   Copy_Atom<SM75_U32x4_LDSM_N, half_t> s2r_atom_B;
 
   int smem_size = int(sizeof(SharedStorage<cute::half_t, cute::half_t, decltype(sA), decltype(sB)>));
+  cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8> threadblock_swizzle;
   dim3 dimBlock(size(mmaC));
-  dim3 dimGrid(size(ceil_div(M, bM)),
-               size(ceil_div(N, bN)));
+  // dim3 dimGrid(size(ceil_div(M, bM)),
+  //              size(ceil_div(N, bN)));
+  cutlass::gemm::GemmCoord grid_tiled_shape = threadblock_swizzle.get_tiled_shape({M, N, K},{bM, bN, bK}, 1); 
+  dim3 dimGrid = threadblock_swizzle.get_grid_shape(grid_tiled_shape);
 
   auto kernel_fptr = cute_gemm_device<
       decltype(prob_shape), decltype(cta_tiler),
       cute::half_t, decltype(dA), decltype(sA), decltype(copyA), decltype(s2r_atom_A),
       cute::half_t, decltype(dB), decltype(sB), decltype(copyB), decltype(s2r_atom_B),
       cute::half_t, decltype(dC), decltype(sC), decltype(mmaC),
-      decltype(alpha), decltype(beta)>;
+      decltype(alpha), decltype(beta), decltype(threadblock_swizzle)>;
 
   // Set L1 to be SMEM only
   cudaFuncSetAttribute(
@@ -461,7 +467,7 @@ cudaError_t cute_example_gemm(
                                                         A, dA, sA, copyA, s2r_atom_A,
                                                         B, dB, sB, copyB, s2r_atom_B,
                                                         C, dC, sC, mmaC,
-                                                        alpha, beta);
+                                                        alpha, beta, threadblock_swizzle);
 
   return cudaSuccess;
 }
