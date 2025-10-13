@@ -6,6 +6,7 @@
 #include <ATen/xpu/XPUContext.h>
 #include <vector>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cute/util/print_svg.hpp>
 
 #include <cute/tensor.hpp>
 #include "cutlass/kernel_hardware_info.h"
@@ -17,6 +18,8 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
 #include "cutlass/fast_math.h"
+#include <cutlass/gemm/threadblock/threadblock_swizzle.h>
+#include <cute/util/compat.hpp>
 
 #include <sycl/sycl.hpp>
 
@@ -39,8 +42,11 @@ void cute_gemm_device(ATensor const &A, // (M,K)
 
   /* Get workgroup and local IDs */
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
-  auto wg_m = int(item.get_group(1));
-  auto wg_n = int(item.get_group(0));
+  // auto wg_m = int(item.get_group(1));
+  // auto wg_n = int(item.get_group(0));
+  auto wg_m = int(item.get_group(0));
+  auto wg_n = int(item.get_group(1));
+
   auto local_id = int(item.get_local_id(0));
 
   /* Create proxy coordinate tensors for each global tensor */
@@ -50,6 +56,11 @@ void cute_gemm_device(ATensor const &A, // (M,K)
 
   /* Split GEMM into workgroup tiles, and identify our workgroup's tile (wg_coord) */
   auto wg_tile = mma.tile_mnk();
+
+  // auto swizzle_coord = swizzle.get_tile_offset(swizzle.get_tiled_shape({get<0>(A.shape()), get<0>(B.shape()), get<1>(A.shape())}, {size<0>(wg_tile), size<1>(wg_tile), size<2>(wg_tile)}, 1));
+  // auto wg_m = int(swizzle_coord.m());
+  // auto wg_n = int(swizzle_coord.n());
+
   auto wg_coord = make_coord(wg_m, wg_n, 0);
 
   Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _)); // (BLK_M,BLK_K,k)
@@ -58,8 +69,57 @@ void cute_gemm_device(ATensor const &A, // (M,K)
 
   /* Create block 2D TiledCopies */
   auto copy_a = make_block_2d_copy_A(mma, A);
+  // TiledCopy
+  //   Tiler_MN:       (_256,_32)
+  //   TiledLayout_TV: ((_16,(_4,_8)),((_1,_32,_2),_1)):((_256,(_0,_32)),((_256,_1,_4096),_0))
+  // Copy_Atom (XE_LOAD_2D)
+  //   BlockWidth:   16
+  //   Width:        32
+  //   Height:       32
+  //   CopyType:     16b
+  //   ValueType:    16b
+  //   XMode:        _1
+  //   YMode:        _0
+  //   TiledStrides: (_0,_0)
+
+  //   ThrID:        _16:_1
+  //   ValLayoutSrc: ((_16),(_1,_32,_2)):((_0),(_1,_32,_16))
+  //   ValLayoutDst: (_16,(_1,_32,_2)):(_1,(_1,_32,_16))
+  //   ValLayoutRef: (_16,(_1,_32,_2)):(_1,(_1,_32,_16))
   auto copy_b = make_block_2d_copy_B(mma, B);
+  // TiledCopy
+  //   Tiler_MN:       (_256,_32)
+  //   TiledLayout_TV: (((_2,_8),(_4,_8)),((_1,_2,_8),(_4,_2))):(((_256,_1),(_64,_0)),((_256,_8,_512),(_16,_4096)))
+  // Copy_Atom (XE_LOAD_2D_TRANSPOSE)
+  //   Width:        8
+  //   Height:       16
+  //   CopyType:     32b
+  //   ValueType:    16b
+  //   XMode:        _1
+  //   YMode:        _0
+  //   TiledStrides: (_0,_0)
+
+  //   ThrID:        _16:_1
+  //   ValLayoutSrc: ((_16),(_1,_2,_8)):((_0),(_1,_128,_2))
+  //   ValLayoutDst: ((_2,_8),(_1,_2,_8)):((_1,_16),(_1,_128,_2))
+  //   ValLayoutRef: ((_2,_8),(_1,_2,_8)):((_1,_16),(_1,_128,_2))
   auto copy_c = make_block_2d_copy_C(mma, C);
+  // TiledCopy
+  //   Tiler_MN:       (_256,_256)
+  //   TiledLayout_TV: ((_16,(_4,_8)),((_1,_8),(_4,_4))):((_256,(_16384,_32)),((_256,_1),(_8,_4096)))
+  // Copy_Atom (XE_STORE_2D)
+  //   Width:        16
+  //   Height:       8
+  //   CopyType:     16b
+  //   ValueType:    16b
+  //   XMode:        _1
+  //   YMode:        _0
+  //   TiledStrides: (_0,_0)
+
+  //   ThrID:        _16:_1
+  //   ValLayoutSrc: (_16,(_1,_8)):(_1,(_1,_16))
+  //   ValLayoutDst: ((_16),(_1,_8)):((_0),(_1,_16))
+  //   ValLayoutRef: (_16,(_1,_8)):(_1,(_1,_16))
 
   /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
   auto thr_mma = mma.get_slice(local_id);
@@ -68,15 +128,29 @@ void cute_gemm_device(ATensor const &A, // (M,K)
 
   /* Register fragments for MMA */
   auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  // SubgroupTensor
+  //   Tensor:           ptr[16b](0x2000000000000000) o (_8,_4,_2):(_1,_8,_32)
+  //   SubgroupTVLayout: (_16,(_8,(_4,_2))):(_1@1,(_1@0,(_8@0,_16@1)))
   auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+  // SubgroupTensor
+  //   Tensor:           ptr[16b](0x2000000000000000) o ((_2,_8),_4,_2):((_1,_2),_16,_64)
+  //   SubgroupTVLayout: ((_2,_8),((_2,_8),(_4,_2))):((_1@1,_1@0),((_8@0,_2@1),(_16@0,_16@1)))
 
   /* Register fragments for copies */
   auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+  // SubgroupTensor
+  //   Tensor:           ptr[16b](0x2000000000000000) o (((_32,_2),_1),_1,_1):(((_1,_32),_0),_0,_0)
+  //   SubgroupTVLayout: ((_16),((_32,_2),_1),(_1,_1)):((_1@1),((_1@0,_16@1),_0),(_0,_0))
   auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+  // SubgroupTensor
+  //   Tensor:           ptr[16b](0x2000000000000000) o (((_2,_8),(_4,_2)),_1,_1):(((_1,_2),(_16,_64)),_0,_0)
+  //   SubgroupTVLayout: ((_2,_8),((_2,_8),(_4,_2)),(_1,_1)):((_1@1,_1@0),((_8@0,_2@1),(_16@0,_16@1)),(_0,_0))
 
   /* Partition global tensor (proxies) for copies */
   Tensor tAgA = thr_copy_a.partition_S(gA);
+  // ArithTuple(0,_0) o (((_32,_2),_1),_1,_1,64):(((_1@0,_16@1),_0),_0,_0,_32@1)
   Tensor tBgB = thr_copy_b.partition_S(gB);
+  // ArithTuple(0,_0) o (((_2,_8),(_4,_2)),_1,_1,64):(((_8@0,_2@1),(_16@0,_16@1)),_0,_0,_32@1)
 
   /* Partition C */
   Tensor tCrC = partition_fragment_C(mma, select<0, 1>(wg_tile));
@@ -86,7 +160,39 @@ void cute_gemm_device(ATensor const &A, // (M,K)
 
   /* Create prefetch TiledCopy instances */
   auto prefetch_a = make_block_2d_prefetch(copy_a);
+  // TiledCopy
+  //   Tiler_MN:       (_256,_32)
+  //   TiledLayout_TV: ((_16,(_32,_1)),((_1,(_2,_8)),(_1,_1))):((_256,(_8,_0)),((_256,(_4096,_1)),(_0,_0)))
+  // Copy_Atom (XE_PREFETCH_2D)
+  //   Width:        32
+  //   Height:       8
+  //   CopyType:     16b
+  //   ValueType:    16b
+  //   XMode:        _1
+  //   YMode:        _0
+  //   TiledStrides: (_0,_0)
+
+  //   ThrID:        _16:_1
+  //   ValLayoutSrc: ((_16),(_1,_16)):((_0),(_1,_16))
+  //   ValLayoutDst: (_16,(_1,_16)):(_1,(_1,_16))
+  //   ValLayoutRef: (_16,(_1,_16)):(_1,(_1,_16))
   auto prefetch_b = make_block_2d_prefetch(copy_b);
+  // TiledCopy
+  //   Tiler_MN:       (_256,_32)
+  //   TiledLayout_TV: ((_16,(_32,_1)),((_1,(_2,_8)),(_1,_1))):((_256,(_8,_0)),((_256,(_4096,_1)),(_0,_0)))
+  // Copy_Atom (XE_PREFETCH_2D)
+  //   Width:        32
+  //   Height:       8
+  //   CopyType:     16b
+  //   ValueType:    16b
+  //   XMode:        _1
+  //   YMode:        _0
+  //   TiledStrides: (_0,_0)
+
+  //   ThrID:        _16:_1
+  //   ValLayoutSrc: ((_16),(_1,_16)):((_0),(_1,_16))
+  //   ValLayoutDst: (_16,(_1,_16)):(_1,(_1,_16))
+  //   ValLayoutRef: (_16,(_1,_16)):(_1,(_1,_16))
 
   auto thr_prefetch_A = prefetch_a.get_slice(local_id);
   auto thr_prefetch_B = prefetch_b.get_slice(local_id);
@@ -122,7 +228,11 @@ void cute_gemm_device(ATensor const &A, // (M,K)
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++)
   {
     /* Split barrier keeping threads loosely together */
-    barrier_arrive(barrier_scope);
+    // barrier_arrive(barrier_scope);
+    // barrier_scope = 2 means workgroup scope
+    // https://github.com/intel/intel-graphics-compiler/blob/master/IGC/VectorCompiler/lib/BiF/Spirv/barrier.cpp#L120
+    // https://github.com/intel/intel-graphics-compiler/blob/master/IGC/BiFModule/Headers/spirv_atomics_common.h
+    // https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_split_barrier.html
 
     /* Copy A/B from global memory (ideally L1 cache) to registers */
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
@@ -140,7 +250,7 @@ void cute_gemm_device(ATensor const &A, // (M,K)
     gemm(mma, tCrA, tCrB, tCrC);
 
     /* Other half of split barrier */
-    barrier_wait(barrier_scope);
+    // barrier_wait(barrier_scope);
   }
 
   CUTE_UNROLL
@@ -169,6 +279,9 @@ static constexpr bool is_complete_v = is_complete<T>::value;
 template <typename TA, typename TB, typename TC>
 auto choose_mma_op()
 {
+  // M 8 (1, 2, 4, 8)
+  // N 16 (subgroup size 16)
+  // K 256bit / 16bit = 16
   if constexpr (is_complete_v<XE_DPAS_TT<8, TC, TA, TB>>)
     return XE_DPAS_TT<8, TC, TA, TB>{};
   else if constexpr (is_same_v<TA, cute::bfloat16_t>)
@@ -234,15 +347,37 @@ cutlass::Status cute_example_gemm(
   auto TensorC = make_tensor(make_gmem_ptr(C), make_layout(make_shape(M, N), dC));
 
   auto mma = choose_tiled_mma(TensorA, TensorB, TensorC);
-  sycl::range<2> local = {size(mma), 1};
-  sycl::range<2> global = {local[0] * ceil_div(shape<0>(TensorB), get<1>(mma.tile_mnk())),
-                           local[1] * ceil_div(shape<0>(TensorA), get<0>(mma.tile_mnk()))};
+  // TiledMMA
+  //   ThrLayoutVMNK:  (_16,_8,_4,_1):(_1,_64,_16,_0)
+  //   PermutationMNK: ((_8,_8,_4):(_1,_32,_8),(_16,_4,_4):(_1,_64,_16),_32:_1)
+  // MMA_Atom
+  //   ThrID:      _16:_1
+  //   Shape_MNK:  (_8,_16,_16)
+  //   LayoutA_TV: (_16,_8):(_8,_1)
+  //   LayoutB_TV: ((_2,_8),(_2,_8)):((_16,_1),(_8,_32))
+  //   LayoutC_TV: (_16,_8):(_8,_1)
+
+  // GemmHorizontalThreadblockSwizzle seems better on bmg, so no need threadblock swizzle here
+  // cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8> threadblock_swizzle;
+  // cutlass::gemm::GemmCoord grid_tiled_shape = threadblock_swizzle.get_tiled_shape({M, N, K}, {_256{}, _256{}, _32{}}, 1);
+  // compat::dim3 dimGrid = threadblock_swizzle.get_grid_shape(grid_tiled_shape);
+  sycl::range<2> local = {size(mma), 1}; // 512
+  // tiling size: (256, 256, 32)
+  // sycl::range<2> global = {local[0] * ceil_div(shape<0>(TensorB), get<1>(mma.tile_mnk())),
+  //                          local[1] * ceil_div(shape<0>(TensorA), get<0>(mma.tile_mnk()))};
+
+  sycl::range<2> global = {local[0] * ceil_div(shape<0>(TensorA), get<0>(mma.tile_mnk())),
+                           local[1] * ceil_div(shape<0>(TensorB), get<1>(mma.tile_mnk()))};
+
+  // sycl::range<2> global = {local[0] * dimGrid.y,
+  //                          local[1] * dimGrid.x};
 
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
 
   syclex::properties kernel_props{
       syclex::sub_group_size<16>,
+      syclex::work_group_scratch_size(0),
       intelex::grf_size<256>};
 
   auto event = queue.parallel_for<GemmCuteName>(sycl::nd_range<2>(global, local), kernel_props,

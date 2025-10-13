@@ -77,5 +77,5 @@ if __name__ == "__main__":
         run_benchmark(lib.basic_gemm, a, b, out=c, tag="cutlass_basic_gemm")
         run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
         c_cute = c.cpu()
-    # print(c_torch, c_cute)
+        print((c_cute - c_torch).sum())
     print("-" * 80)
