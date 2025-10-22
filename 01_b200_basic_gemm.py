@@ -4,14 +4,14 @@ from common.utils import run_benchmark, common_cuda_flags, common_sycl_flags
 from torch.utils.cpp_extension import load
 from functools import partial
 import os
-os.environ["TORCH_XPU_ARCH_LIST"] = "pvc,bmg"
 device = "xpu" if torch.xpu.is_available() else "cuda"
-if device == "xpu":
-    # host compiler by default is c++, which will cause compile error
-    os.environ["CXX"] = "icpx"
 SM = '89'  # 4090, Ada
-if device == "cuda" and "A100" in torch.cuda.get_device_name():
-    SM = '80'  # A100, Ampere
+if device == "cuda" and "B200" in torch.cuda.get_device_name():
+    SM = '100a'  # B200, Blackwell
+else:
+    quit()
+
+
 
 
 if __name__ == "__main__":
@@ -24,6 +24,7 @@ if __name__ == "__main__":
 
     macros = [
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         f"-DTORCH_CURRENT_DEVICE=cutlass::arch::Sm{SM}",
         f"-gencode=arch=compute_{SM},code=sm_{SM}",
         # "-g -lineinfo"
@@ -33,8 +34,8 @@ if __name__ == "__main__":
     lib = None
     if device == "xpu":
         lib = load(
-            name="basic_gemm_lib",
-            sources=["basic_gemm/basic_gemm.sycl", "basic_gemm/cute_0.sycl"],
+            name="b200_basic_gemm_lib",
+            sources=[],# ["b200_basic_gemm/basic_gemm.sycl", "b200_basic_gemm/cute_0.sycl"],
             extra_sycl_cflags=common_sycl_flags,
             extra_cflags=["-std=c++17"] + macros,
             extra_include_paths=[os.path.join(
@@ -45,17 +46,17 @@ if __name__ == "__main__":
         )
     else:
         lib = load(
-            name="basic_gemm_lib",
-            sources=["basic_gemm/basic_gemm.cu",
-                     "basic_gemm/cute_0.cu"],
+            name="b200_basic_gemm_lib",
+            sources=["b200_basic_gemm/basic_gemm.cu",
+            ],
             extra_cuda_cflags=common_cuda_flags + macros,
             extra_cflags=["-std=c++17"],
-            extra_include_paths=[os.path.join(CUTLASS_REPO_PATH, "include")],
+            extra_include_paths=[os.path.join(CUTLASS_REPO_PATH, "include"), "./third_party/cutlass/tools/util/include"],
             verbose=True,
         )
 
     print("-" * 80)
-    M, N, K = 8192, 4096, 2048
+    M, N, K = 8192*2, 4096*2, 2048*4
     if device == "cuda":
         # a_tile = torch.arange(128*64).reshape(128, 64).half().cuda()/100.
         # a = a_tile.repeat(M//128, K//64)
@@ -65,7 +66,7 @@ if __name__ == "__main__":
         run_benchmark(partial(torch.matmul, out=c), a, b, tag="f16_torch")
         c_torch = c.cpu()
         run_benchmark(lib.basic_gemm, a, b, out=c, tag="cutlass_basic_gemm")
-        run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
+        # run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
         c_cute = c.cpu()
         print((c_cute == c_torch).all())
     if device == "xpu":

@@ -14,7 +14,11 @@ common_sycl_flags = ["-O3"]
 
 
 def flush_cache():
-    torch.sum(torch.randn(1024, 1024, 256,
+    shape = (1024, 1024, 256)
+    if torch.accelerator.current_accelerator().type == 'cuda':
+        if "B200" in torch.cuda.get_device_name():
+            shape = (1024, 1024, 1024)
+    torch.sum(torch.randn(shape,
               device=torch.accelerator.current_accelerator()))
 
 
