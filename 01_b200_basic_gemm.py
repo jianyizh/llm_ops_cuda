@@ -12,8 +12,6 @@ else:
     quit()
 
 
-
-
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
 
@@ -35,7 +33,7 @@ if __name__ == "__main__":
     if device == "xpu":
         lib = load(
             name="b200_basic_gemm_lib",
-            sources=[],# ["b200_basic_gemm/basic_gemm.sycl", "b200_basic_gemm/cute_0.sycl"],
+            sources=[],  # ["b200_basic_gemm/basic_gemm.sycl", "b200_basic_gemm/cute_0.sycl"],
             extra_sycl_cflags=common_sycl_flags,
             extra_cflags=["-std=c++17"] + macros,
             extra_include_paths=[os.path.join(
@@ -48,10 +46,12 @@ if __name__ == "__main__":
         lib = load(
             name="b200_basic_gemm_lib",
             sources=["b200_basic_gemm/basic_gemm.cu",
-            ],
+                     "b200_basic_gemm/cute_0.cu",
+                     ],
             extra_cuda_cflags=common_cuda_flags + macros,
             extra_cflags=["-std=c++17"],
-            extra_include_paths=[os.path.join(CUTLASS_REPO_PATH, "include"), "./third_party/cutlass/tools/util/include"],
+            extra_include_paths=[os.path.join(
+                CUTLASS_REPO_PATH, "include"), "./third_party/cutlass/tools/util/include"],
             verbose=True,
         )
 
@@ -66,7 +66,7 @@ if __name__ == "__main__":
         run_benchmark(partial(torch.matmul, out=c), a, b, tag="f16_torch")
         c_torch = c.cpu()
         run_benchmark(lib.basic_gemm, a, b, out=c, tag="cutlass_basic_gemm")
-        # run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
+        run_benchmark(lib.cute_example, a, b, out=c, tag="cute_example_gemm")
         c_cute = c.cpu()
         print((c_cute == c_torch).all())
     if device == "xpu":

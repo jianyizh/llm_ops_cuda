@@ -4,6 +4,7 @@ from typing import Optional, Any
 
 
 common_cuda_flags = ["-O3",
+                     "-forward-unknown-to-host-compiler",
                      "--expt-relaxed-constexpr",
                      "-ftemplate-backtrace-limit=0",
                      "-Xcompiler=-Wconversion",

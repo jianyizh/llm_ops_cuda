@@ -163,10 +163,10 @@ void basic_gemm(torch::Tensor &a, torch::Tensor &b, torch::Tensor &c)
   }
 }
 
-// extern void cute_example(torch::Tensor &a, torch::Tensor &b, torch::Tensor &c);
+extern void cute_example(torch::Tensor &a, torch::Tensor &b, torch::Tensor &c);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   TORCH_BINDING_COMMON_EXTENSION(basic_gemm)
-  // TORCH_BINDING_COMMON_EXTENSION(cute_example)
+  TORCH_BINDING_COMMON_EXTENSION(cute_example)
 }
