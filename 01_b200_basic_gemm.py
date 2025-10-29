@@ -1,4 +1,4 @@
-
+# ncu --config-file off --export ./cute_b200_gemm_1 --force-overwrite --kernel-name gemm_device_0 --set full --import-source yes python 01_b200_basic_gemm.py
 import torch
 from common.utils import run_benchmark, common_cuda_flags, common_sycl_flags
 from torch.utils.cpp_extension import load
@@ -56,7 +56,7 @@ if __name__ == "__main__":
         )
 
     print("-" * 80)
-    M, N, K = 8192*2, 4096*2, 2048*4
+    M, N, K = 16384, 8192, 8192
     if device == "cuda":
         # a_tile = torch.arange(128*64).reshape(128, 64).half().cuda()/100.
         # a = a_tile.repeat(M//128, K//64)
