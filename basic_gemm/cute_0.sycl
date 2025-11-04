@@ -103,7 +103,7 @@ void cute_gemm_device(ATensor const &A, // (M,K)
   //   ValLayoutSrc: ((_16),(_1,_2,_8)):((_0),(_1,_128,_2))
   //   ValLayoutDst: ((_2,_8),(_1,_2,_8)):((_1,_16),(_1,_128,_2))
   //   ValLayoutRef: ((_2,_8),(_1,_2,_8)):((_1,_16),(_1,_128,_2))
-  auto copy_c = make_block_2d_copy_C(mma, C);
+  auto copy_c = make_block_2d_copy_D(mma, C);
   // TiledCopy
   //   Tiler_MN:       (_256,_256)
   //   TiledLayout_TV: ((_16,(_4,_8)),((_1,_8),(_4,_4))):((_256,(_16384,_32)),((_256,_1),(_8,_4096)))
