@@ -47,6 +47,7 @@ if __name__ == "__main__":
             name="b200_basic_gemm_lib",
             sources=["b200_basic_gemm/basic_gemm.cu",
                      "b200_basic_gemm/cute_0.cu",
+                     "b200_basic_gemm/cute_1.cu",
                      ],
             extra_cuda_cflags=common_cuda_flags + macros,
             extra_cflags=["-std=c++17"],
