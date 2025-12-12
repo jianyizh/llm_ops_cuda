@@ -1,0 +1,210 @@
+#include <algorithm>
+#include <float.h>
+#include <iostream>
+#include <torch/extension.h>
+#include <torch/types.h>
+#include <ATen/xpu/XPUContext.h>
+#include <vector>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include "flash_attention_v2/collective/fmha_fusion.hpp"
+#include "flash_attention_v2/kernel/tile_scheduler.hpp"
+#include "cutlass/util/packed_stride.hpp"
+#include "flash_attention_v2/kernel/xe_flash_attn_prefill.hpp"
+#include "flash_attention_v2/collective/xe_flash_attn_prefill_epilogue.hpp"
+#include "flash_attention_v2/collective/xe_flash_attn_prefill_softmax_epilogue.hpp"
+#include <cute/tensor.hpp>
+#include "cutlass/kernel_hardware_info.h"
+#include "cutlass/platform/platform.h"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/util/sycl_event_manager.hpp"
+#include "cutlass/util/GPU_Clock.hpp"
+#include "cutlass/util/reference/device/gemm_complex.h"
+#include "cutlass/util/reference/device/tensor_compare.h"
+#include "cutlass/util/reference/host/tensor_fill.h"
+#include "cutlass/fast_math.h"
+#include <cutlass/gemm/threadblock/threadblock_swizzle.h>
+#include <cute/util/compat.hpp>
+
+#include <sycl/sycl.hpp>
+
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+using namespace cute;
+using LayoutQ = cutlass::layout::RowMajor;
+using LayoutK = cutlass::layout::ColumnMajor;
+using LayoutV = cutlass::layout::RowMajor;
+using LayoutO = cutlass::layout::RowMajor;
+
+template <class kernel>
+class name;
+
+template <bool Causal,
+          typename TileShapeQK,
+          typename TileShapePV,
+          typename TileShapeOutput,
+          typename SubgroupLayout,
+          int PipelineStages,
+          typename ElementInputQ = cute::half_t,
+          typename ElementInputKV = cute::half_t,
+          typename MMAOperation = XE_8x16x16_F32F16F16F32_TT,
+          typename GmemTiledCopyQ = XE_2D_U16x8x32_LD_N,
+          typename GmemTiledCopyK = XE_2D_U16x16x16_LD_T, // _T designates a transposed block load operation
+          typename GmemTiledCopyV = XE_2D_U16x16x32_LD_V,
+          typename ElementAccumulator = float,
+          typename ElementComputeEpilogue = float,
+          typename ElementOutput = cute::half_t,
+          typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
+cutlass::Status cute_example_mha(
+    cute::half_t const *q,
+    cute::half_t const *k,
+    cute::half_t const *v,
+    cute::half_t *out,
+    const int batch_size,
+    const int seqlen_q,
+    const int num_head,
+    const int head_dim,
+    const int seqlen_k,
+    torch::Device device)
+{
+  auto queue = at::xpu::getCurrentXPUStream().queue();
+  using Scheduler = cutlass::flash_attention::IndividualScheduler;
+  // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
+  // information is used by the underlying kernel.
+  cutlass::KernelHardwareInfo hw_info;
+
+  // The code section below describes datatype for input, output matrices and computation between
+  // elements in input matrices.
+
+  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
+  using CollectiveEpilogue = cutlass::flash_attention::collective::FlashPrefillEpilogue<
+      EpilogueDispatchPolicy, MMAOperation, TileShapeOutput, SubgroupLayout, ElementComputeEpilogue, ElementOutput, cutlass::gemm::TagToStrideC_t<LayoutO>, ElementOutput,
+      GmemTiledCopyStore>;
+  using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::FlashPrefillSoftmaxEpilogue<Causal, EpilogueDispatchPolicy, ElementAccumulator>;
+
+  using namespace cutlass::fmha::collective;
+  using ProblemShapeType = cute::tuple<int, int, int, int, int, int, int>;
+
+  // Mainloop
+  using CollectiveMainloop = cutlass::flash_attention::collective::FlashPrefillMma<
+      GEMMDispatchPolicy, ProblemShapeType, ElementInputQ, cutlass::gemm::TagToStrideA_t<LayoutQ>, ElementInputKV,
+      cutlass::gemm::TagToStrideB_t<LayoutK>, ElementInputKV, cutlass::gemm::TagToStrideB_t<LayoutV>, MMAOperation, TileShapeQK, TileShapePV, SubgroupLayout,
+      GmemTiledCopyQ, // Q
+      GmemTiledCopyK, // K
+      GmemTiledCopyV, // V,
+      Causal>;
+
+  using FMHAPrefillKernel = cutlass::flash_attention::kernel::FMHAPrefill<ProblemShapeType, CollectiveMainloop,
+                                                                          CollectiveSoftmaxEpilogue, CollectiveEpilogue, Scheduler>;
+
+  using StrideQ = typename FMHAPrefillKernel::StrideQ;
+  using StrideK = typename FMHAPrefillKernel::StrideK;
+  using StrideV = typename FMHAPrefillKernel::StrideV;
+  using StrideO = typename FMHAPrefillKernel::StrideO;
+
+  using ElementQ = typename FMHAPrefillKernel::ElementQ;
+  using ElementK = typename FMHAPrefillKernel::ElementK;
+  using ElementV = typename FMHAPrefillKernel::ElementV;
+
+  using CollectiveEpilogue = typename FMHAPrefillKernel::CollectiveEpilogue;
+  using ElementCompute = typename CollectiveEpilogue::ElementCompute;
+
+  ProblemShapeType problem_size = cute::make_tuple(batch_size, /*num_heads_q*/ num_head, /*num_heads_kv*/ num_head, seqlen_q, seqlen_k, /*head_size_qk*/ head_dim, /*head_size_vo*/ head_dim);
+  auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo] = problem_size;
+  StrideQ stride_Q = cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo, head_size_qk, batch * num_heads_q));
+  StrideK stride_K = cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, head_size_qk, batch * num_heads_kv));
+  StrideV stride_V = cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size_vo, seq_len_kv, batch * num_heads_kv));
+  StrideO stride_O = cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(seq_len_qo, head_size_vo, batch * num_heads_q));
+
+  typename FMHAPrefillKernel::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_size,
+      {q, stride_Q, k, stride_K, v, stride_V},
+      {1 / sqrt(static_cast<float>(head_size_qk))},
+      {out, stride_O},
+      hw_info};
+
+  size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
+  auto workspace = torch::empty({static_cast<int64_t>(workspace_size)}, torch::dtype(torch::kUInt8).device(device));
+
+  if (!FMHAPrefillKernel::can_implement(arguments))
+  {
+    std::cout << "Invalid Problem Size: " << batch << 'x' << num_heads_q << 'x' << seq_len_qo << 'x' << seq_len_kv << 'x' << head_size_qk << 'x' << head_size_vo
+              << (Causal ? "xCausal" : "xNonCausal") << std::endl;
+    return cutlass::Status::kErrorInvalidProblem;
+  }
+
+  // Initialize the workspace
+  FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr<uint8_t>());
+
+  // Convert host-side arguments to device-side arguments to be passed to the kernel
+  auto params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr<uint8_t>());
+
+  // Run the GEMM
+  dim3 const block = FMHAPrefillKernel::get_block_shape();
+  dim3 const grid = FMHAPrefillKernel::get_grid_shape(params);
+
+  // configure smem size and carveout
+  int smem_size = FMHAPrefillKernel::SharedStorageSize;
+
+  const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+  const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+
+  // using namespace compat::experimental;
+  // auto event = launch<cutlass::device_kernel<FMHAPrefillKernel>, name<FMHAPrefillKernel>>(
+  //     launch_policy{sycl_grid, sycl_block, local_mem_size{static_cast<std::size_t>(smem_size)},
+  //                   kernel_properties{sycl_exp::sub_group_size<FMHAPrefillKernel::DispatchPolicy::SubgroupSize>}},
+  //     queue,
+  //     params);
+  compat::experimental::launch_properties launch_props{
+      sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
+  };
+  compat::experimental::kernel_properties kernel_props{
+      sycl::ext::oneapi::experimental::sub_group_size<FMHAPrefillKernel::DispatchPolicy::SubgroupSize>};
+  compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
+  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, FMHAPrefillKernel>(policy, queue, params);
+
+  return cutlass::Status::kSuccess;
+}
+
+void cute_example(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, torch::Tensor &out)
+{
+  const int batch_size = q.size(0);
+  const int seqlen_q = q.size(2);
+  const int num_head = q.size(1);
+  const int head_dim = q.size(3);
+  const int seqlen_k = k.size(2);
+
+  // head_dim 128
+  using ShapeQK = Shape<_128, _64, _64>;
+  using ShapePV = Shape<_128, _32, _64>;
+  using ShapeOutPut = Shape<_128, _128, _64>;
+  using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
+  constexpr int PipelineStages = 2;
+  auto result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
+                                                                                                                  reinterpret_cast<cute::half_t *>(k.data_ptr()),
+                                                                                                                  reinterpret_cast<cute::half_t *>(v.data_ptr()),
+                                                                                                                  reinterpret_cast<cute::half_t *>(out.data_ptr()),
+                                                                                                                  batch_size,
+                                                                                                                  seqlen_q,
+                                                                                                                  num_head,
+                                                                                                                  head_dim,
+                                                                                                                  seqlen_k,
+                                                                                                                  q.device());
+  if (result != cutlass::Status::kSuccess)
+  {
+    std::cerr << "CUTLASS mha kernel failed: "
+              << cutlassGetStatusString(result) << std::endl;
+  }
+}
+
+#define STRINGFY(str) #str
+#define TORCH_BINDING_COMMON_EXTENSION(func) \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
+  TORCH_BINDING_COMMON_EXTENSION(cute_example)
+}

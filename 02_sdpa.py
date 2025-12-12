@@ -34,11 +34,11 @@ if __name__ == "__main__":
     if device == "xpu":
         lib = load(
             name="flash_attention_lib",
-            sources=["basic_gemm/basic_gemm.sycl", "basic_gemm/cute_0.sycl"],
+            sources=["fmha/xpu/cute.sycl"],
             extra_sycl_cflags=common_sycl_flags,
             extra_cflags=["-std=c++17"] + macros,
             extra_include_paths=[os.path.join(
-                CUTLASS_REPO_PATH, "include"), "./third_party/cutlass-sycl/tools/util/include"],
+                CUTLASS_REPO_PATH, "include"), "./third_party/cutlass-sycl/tools/util/include", "./third_party/cutlass-sycl/tools/util/include", "./fmha/xpu"],
             # extra_ldflags=["-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier"],
             # I have to add sycl_dlink_post_cflags += ['-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier'] and remove spir64 from -fsycl-targets
             verbose=True,
@@ -51,14 +51,35 @@ if __name__ == "__main__":
 
     if device == "cuda":
         with torch.no_grad():
-            q = torch.randn((batch, seq_len, num_heads, head_dim)).cuda().half().contiguous().transpose(1,2)
-            k = torch.randn((batch, seq_len, num_heads, head_dim)).cuda().half().contiguous().transpose(1,2)
-            v = torch.randn((batch, seq_len, num_heads, head_dim)).cuda().half().contiguous().transpose(1,2)
-            output = torch.zeros((batch, num_heads, seq_len, head_dim)).cuda().half().contiguous()
-            output, _ = run_benchmark(torch.nn.functional.scaled_dot_product_attention, q,k,v, tag="f16_torch")
+            q = torch.randn((batch, seq_len, num_heads, head_dim)
+                            ).cuda().half().contiguous().transpose(1, 2)
+            k = torch.randn((batch, seq_len, num_heads, head_dim)
+                            ).cuda().half().contiguous().transpose(1, 2)
+            v = torch.randn((batch, seq_len, num_heads, head_dim)
+                            ).cuda().half().contiguous().transpose(1, 2)
+            output = torch.zeros(
+                (batch, num_heads, seq_len, head_dim)).cuda().half().contiguous()
+            output, _ = run_benchmark(
+                torch.nn.functional.scaled_dot_product_attention, q, k, v, tag="f16_torch")
             from flash_attn import flash_attn_func
 
-            output, _ = run_benchmark(flash_attn_func, q,k,v, tag="f16_flash_attn")
+            output, _ = run_benchmark(
+                flash_attn_func, q, k, v, tag="f16_flash_attn")
+    else:
+        with torch.no_grad():
+            q = torch.randn((batch, num_heads, seq_len, head_dim)
+                            ).xpu().half().contiguous()
+            k = torch.randn((batch, num_heads, seq_len, head_dim)
+                            ).xpu().half().contiguous()
+            v = torch.randn((batch, num_heads, seq_len, head_dim)
+                            ).xpu().half().contiguous()
+            output = torch.zeros(
+                (batch, num_heads, seq_len, head_dim)).xpu().half().contiguous()
+            output, _ = run_benchmark(
+                torch.nn.functional.scaled_dot_product_attention, q, k, v, tag="f16_torch")
+            output_a = output.clone()
+            output, _ = run_benchmark(
+                lib.cute_example, q, k, v, out=output, tag="f16_cutlass_xpu")
+            print((output - output_a).abs().max())
 
-        
     print("-" * 80)
