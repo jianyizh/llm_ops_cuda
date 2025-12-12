@@ -34,7 +34,7 @@ if __name__ == "__main__":
     if device == "xpu":
         lib = load(
             name="flash_attention_lib",
-            sources=["fmha/xpu/cute.sycl"],
+            sources=["fmha/xpu/cute_legacy.sycl", "fmha/xpu/cute.sycl"],
             extra_sycl_cflags=common_sycl_flags,
             extra_cflags=["-std=c++17"] + macros,
             extra_include_paths=[os.path.join(
@@ -77,9 +77,14 @@ if __name__ == "__main__":
                 (batch, num_heads, seq_len, head_dim)).xpu().half().contiguous()
             output, _ = run_benchmark(
                 torch.nn.functional.scaled_dot_product_attention, q, k, v, tag="f16_torch")
-            output_a = output.clone()
+            output_torch = output.cpu()
             output, _ = run_benchmark(
-                lib.cute_example, q, k, v, out=output, tag="f16_cutlass_xpu")
-            print((output - output_a).abs().max())
+                lib.cute_example_legacy, q, k, v, out=output, tag="f16_cute_legacy_xpu")
+            output_legacy = output.cpu()
+            output, _ = run_benchmark(
+                lib.cute_example_xe, q, k, v, out=output, tag="f16_cute_xpu")
+            output_xe = output.cpu()
+            print((output_torch - output_legacy).abs().max())
+            print((output_torch - output_xe).abs().max())
 
     print("-" * 80)
