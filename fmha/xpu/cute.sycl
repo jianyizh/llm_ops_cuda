@@ -37,7 +37,7 @@ using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
 template <class kernel>
-class xe_kernel;
+class xe_fmha_kernel;
 
 template <bool Causal,
           typename TileShapeQK,
@@ -73,7 +73,7 @@ cutlass::Status cute_example_mha(
     torch::Device device)
 {
   auto queue = at::xpu::getCurrentXPUStream().queue();
-
+  // block_m / subgroup_m = 128 / 16 = 8
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<is_void_v<MMAOperation_>,
                                            typename cute::conditional_t<
@@ -84,6 +84,7 @@ cutlass::Status cute_example_mha(
   using SubgroupLayoutPV = cute::conditional_t<is_void_v<SubgroupLayoutPV_>,
                                                decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
                                                SubgroupLayoutPV_>;
+  // SubgroupLayoutPV (_16,_1,_1)
 
   using Scheduler = cute::conditional_t<persistent,
                                         cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler,
@@ -96,11 +97,30 @@ cutlass::Status cute_example_mha(
   using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<false>;
 
   using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
+  // TiledMMA
+  //   ThrLayoutVMNK:  (_16,_16,_1,_1):(_1,_16,_0,_0)
+  //   PermutationMNK: (_128:_1,_64:_1,_32:_1)
+  // MMA_Atom
+  //   ThrID:      _16:_1
+  //   Shape_MNK:  (_8,_16,_16)
+  //   LayoutA_TV: (_16,_8):(_8,_1)
+  //   LayoutB_TV: ((_2,_8),(_2,_8)):((_16,_1),(_8,_32))
+  //   LayoutC_TV: (_16,_8):(_8,_1)
+
   using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
+  // TiledMMA
+  //   ThrLayoutVMNK:  (_16,_16,_1,_1):(_1,_16,_0,_0)
+  //   PermutationMNK: (_128:_1,_32:_1,_64:_1)
+  // MMA_Atom
+  //   ThrID:      _16:_1
+  //   Shape_MNK:  (_8,_16,_16)
+  //   LayoutA_TV: (_16,_8):(_8,_1)
+  //   LayoutB_TV: ((_2,_8),(_2,_8)):((_16,_1),(_8,_32))
+  //   LayoutC_TV: (_16,_8):(_8,_1)
 
   static_assert(get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
                 "Output tile and P*V tile have different sizes in Q dimension");
-  constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
+  constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{}); // 128 / 32 = 4
   auto make_dummy_tensor = [&](auto val, auto stride)
   {
     return make_tensor(make_gmem_ptr(&val),
@@ -147,13 +167,14 @@ cutlass::Status cute_example_mha(
   StrideK stride_K = cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(shape.seq_len_kv, shape.head_size_qk, shape.num_heads_kv, shape.batch));
   StrideV stride_V = cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(shape.head_size_vo, shape.seq_len_kv, shape.num_heads_kv, shape.batch));
   StrideO stride_O = cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(shape.seq_len_qo, shape.head_size_vo, shape.num_heads_q, shape.batch));
-
+  // equivalent to contiguous (batch, num_heads, seqlen_q, head_dim)
   typename FMHAKernel::Arguments arguments{
       {shape,
        q, stride_Q, k, stride_K, v, stride_V, out, stride_O},
       {1 / sqrt(static_cast<float>(shape.head_size_qk))},
       {},
       hw_info};
+
 
   size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
   auto workspace = torch::empty({static_cast<int64_t>(workspace_size)}, torch::dtype(torch::kUInt8).device(device));
@@ -177,23 +198,24 @@ cutlass::Status cute_example_mha(
 
   // configure smem size and carveout
   int smem_size = FMHAKernel::SharedStorageSize;
+  // 0
 
   const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+  // grid.x = head_size_vo / head_dim = 1
+  // grid.y = seqlen_q / m_block_size
+  // grid.z = batch_size * num_head
+  // block.x = 256
+  // block.y = 1
+  // block.z = 1
   const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-  // using namespace compat::experimental;
-  // auto event = launch<cutlass::device_kernel<FMHAKernel>, name<FMHAKernel>>(
-  //     launch_policy{sycl_grid, sycl_block, local_mem_size{static_cast<std::size_t>(smem_size)},
-  //                   kernel_properties{sycl_exp::sub_group_size<FMHAKernel::DispatchPolicy::SubgroupSize>}},
-  //     queue,
-  //     params);
   compat::experimental::launch_properties launch_props{
       sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
   };
   compat::experimental::kernel_properties kernel_props{
       sycl::ext::oneapi::experimental::sub_group_size<cute::intel::sg_size>, sycl::ext::intel::experimental::grf_size<256>};
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, xe_kernel<FMHAKernel>>(policy, queue, params);
+  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, xe_fmha_kernel<FMHAKernel>>(policy, queue, params);
 
   return cutlass::Status::kSuccess;
 }
@@ -207,6 +229,8 @@ void cute_example_xe(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, torch
   const int seqlen_k = k.size(2);
   constexpr int PipelineStages = 2;
   cutlass::Status result;
+
+  // ShapeOut (m_block, head_dim)
   if (head_dim == 64)
   {
     using ShapeQK = Shape<_128, _64, _32>;
@@ -246,7 +270,7 @@ void cute_example_xe(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, torch
     using ShapeQK = Shape<_128, _64, _32>;
     using ShapePV = Shape<_128, _32, _64>;
     using ShapeOut = Shape<_128, _128>;
-    using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
+    using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>; // 16 subgroups on m
     result = cute_example_mha</*causal*/ false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK, void, PipelineStages, /*persistent=*/false, cute::half_t, cute::half_t, cute::half_t>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
                                                                                                                                                                                     reinterpret_cast<cute::half_t *>(k.data_ptr()),
                                                                                                                                                                                     reinterpret_cast<cute::half_t *>(v.data_ptr()),
@@ -258,7 +282,7 @@ void cute_example_xe(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, torch
                                                                                                                                                                                     seqlen_k,
                                                                                                                                                                                     q.device());
   }
-  else if (head_dim == 192)
+  else if (head_dim == 192) 
   {
     using ShapeQK = Shape<_256, _64, _32>;
     using ShapePV = Shape<_256, _32, _64>;
@@ -280,13 +304,6 @@ void cute_example_xe(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, torch
     std::cerr << "Unsupported head_dim: " << head_dim << std::endl;
     return;
   }
-
-  // head_dim 128
-  using ShapeQK = Shape<_128, _64, _32>;
-  using ShapePV = Shape<_128, _32, _64>;
-  using ShapeOut = Shape<_128, _128>;
-  using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
-
   if (result != cutlass::Status::kSuccess)
   {
     std::cerr << "CUTLASS mha kernel failed: "

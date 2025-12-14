@@ -38,13 +38,13 @@ if __name__ == "__main__":
             extra_sycl_cflags=common_sycl_flags,
             extra_cflags=["-std=c++17"] + macros,
             extra_include_paths=[os.path.join(
-                CUTLASS_REPO_PATH, "include"), "./third_party/cutlass-sycl/tools/util/include", "./third_party/cutlass-sycl/tools/util/include", "./fmha/xpu"],
+                CUTLASS_REPO_PATH, "include"), "./third_party/cutlass-sycl/tools/util/include", "./third_party/cutlass-sycl/tools/util/include", "./third_party/cutlass-sycl/applications"],
             # extra_ldflags=["-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier"],
             # I have to add sycl_dlink_post_cflags += ['-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier'] and remove spir64 from -fsycl-targets
             verbose=True,
         )
     print("-" * 80)
-    batch = 1
+    batch = 20
     num_heads = 16
     seq_len = 1024
     head_dim = 128

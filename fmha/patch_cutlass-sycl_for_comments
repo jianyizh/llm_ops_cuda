@@ -1,0 +1,193 @@
+diff --git a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
+index b7c400a6..6473d832 100644
+--- a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
++++ b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
+@@ -188,23 +188,79 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
+     // Primed letters (q', k', ...) refer to atom block indices.
+ 
+     auto tile_shape_v = make_shape(get<1>(TileShapePV{}) * C<VTiles>{}, get<2>(TileShapePV{}));
++    // (128, 64)
+ 
+     /* Create proxy coordinate tensors for Q/K/P/V */
+     Tensor cQ = make_identity_tensor(Q_2D.shape());             // (q,d)
+     Tensor cK = make_identity_tensor(K_2D.shape());             // (k,d)
+     Tensor cV = make_identity_tensor(V_2D.shape());             // (v,k)
+     Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{})); // (q,k)
++    // cp shape: (128, 64)
+ 
+     /* Partition global tensors into workgroup tiles */
+     Tensor gQ       = local_tile(cQ, TileShapeQK{}, append(blk_qv,_),             Step<_1,X,_1>{});   // (q,d,D)
++    // (_128, _32, 4)
+     Tensor gK       = local_tile(cK, TileShapeQK{}, make_coord(_,_,_),            Step<X,_1,_1>{});   // (k,d,K,D)
++    // (_64,_32,16,4)
+     Tensor gV       = local_tile(cV, tile_shape_v,  make_coord(get<1>(blk_qv),_));                    // (v,k,K)
++    // (_128,_64,16)
+     Tensor gV_split = local_tile(gV, TileShapePV{}, make_coord(_,_,0),            Step<X,_1,_1>{});   // (v,k,VV,K)
++    // (_32,_64,_4,16)
+ 
+     /* Create global -> register copies */
+     TiledCopyQ copy_q{Q_2D};
++    // TiledCopy
++    //   Tiler_MN:       (_128,_32)
++    //   TiledLayout_TV: ((_16,_16),((_1,_8,_2),_1)):((_128,_8),((_128,_1,_2048),_0))
++    // Copy_Atom (XE_LOAD_2D)
++    //   BlockWidth:   16
++    //   Width:        32
++    //   Height:       8
++    //   CopyType:     16b
++    //   ValueType:    16b
++    //   XMode:        _1
++    //   YMode:        _0
++    //   TiledStrides: (_0,_0)
++
++    //   ThrID:        _16:_1
++    //   ValLayoutSrc: ((_16),(_1,_8,_2)):((_0),(_1,_32,_16))
++    //   ValLayoutDst: (_16,(_1,_8,_2)):(_1,(_1,_32,_16))
++    //   ValLayoutRef: (_16,(_1,_8,_2)):(_1,(_1,_32,_16))
+     TiledCopyK copy_k{K_2D};
++    // TiledCopy
++    //   Tiler_MN:       (_64,_32)
++    //   TiledLayout_TV: (((_2,_8),_16),((_1,_2,_8),(_4,_2))):(((_64,_1),_0),((_64,_8,_128),(_16,_1024)))
++    // Copy_Atom (XE_LOAD_2D_TRANSPOSE)
++    //   Width:        8
++    //   Height:       16
++    //   CopyType:     32b
++    //   ValueType:    16b
++    //   XMode:        _1
++    //   YMode:        _0
++    //   TiledStrides: (_0,_0)
++
++    //   ThrID:        _16:_1
++    //   ValLayoutSrc: ((_16),(_1,_2,_8)):((_0),(_1,_128,_2))
++    //   ValLayoutDst: ((_2,_8),(_1,_2,_8)):((_1,_16),(_1,_128,_2))
++    //   ValLayoutRef: ((_2,_8),(_1,_2,_8)):((_1,_16),(_1,_128,_2))
+     TiledCopyV copy_v{V_2D};
++    // TiledCopy
++    //   Tiler_MN:       (_32,_64)
++    //   TiledLayout_TV: (((_2,_8),_16),((_1,_2,_8,_2),_4)):(((_32,_1),_0),((_1,_8,_64,_16),_512))
++    // Copy_Atom (XE_LOAD_2D_VNNI)
++    //   BlockWidth:   16
++    //   Width:        32
++    //   Height:       16
++    //   CopyType:     16b
++    //   ValueType:    16b
++    //   XMode:        _0
++    //   YMode:        _1
++    //   TiledStrides: (_0,_0)
++
++    //   ThrID:        _16:_1
++    //   ValLayoutSrc: ((_16),(_1,_2,_8,_2)):((_0),(_1,_8,_64,_16))
++    //   ValLayoutDst: ((_2,_8),(_1,_2,_8,_2)):((_32,_1),(_1,_8,_64,_16))
++    //   ValLayoutRef: ((_2,_8),(_1,_2,_8,_2)):((_32,_1),(_1,_8,_64,_16))
+ 
+     /* Create MMAs */
+     TiledMMAQK mma_qk{};
+@@ -239,6 +295,22 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
+     auto prefetch_q = make_block_2d_prefetch(copy_q);
+     auto prefetch_k = make_block_2d_prefetch(copy_k);
+     auto prefetch_v = make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_2D);
++    // TiledCopy
++    //   Tiler_MN:       (_128,_64)
++    //   TiledLayout_TV: ((_16,(_4,_4)),((_1,(_2,_16)),(_1,_1))):((_1,(_32,_2048)),((_128,(_16,_128)),(_0,_0)))
++    // Copy_Atom (XE_PREFETCH_2D)
++    //   Width:        32
++    //   Height:       16
++    //   CopyType:     16b
++    //   ValueType:    16b
++    //   XMode:        _0
++    //   YMode:        _1
++    //   TiledStrides: (_0,_0)
++
++    //   ThrID:        _16:_1
++    //   ValLayoutSrc: ((_16),(_1,_32)):((_0),(_1,_16))
++    //   ValLayoutDst: (_16,(_1,_32)):(_1,(_1,_16))
++    //   ValLayoutRef: (_16,(_1,_32)):(_1,(_1,_16))
+ 
+     /* Partition global tensors for prefetch */
+     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
+@@ -252,10 +324,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
+     /* Initialization steps for first block: Q/K prefetch, O init */
+     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
+     if (blk_k0 == 0) {
++      // prefetch whole gQ (128, 32 * 4)
+       for (int D = 0; D < size<3>(pQgQ); D++) {
+         prefetch(prefetch_q, pQgQ(_,_,_,D));
+       }
+ 
++      // gK is (64 * 16, 32 * 4) = (1024, 128), prefetch first (64 * Stages, 32 * 4), Stages = 2
+       for (int D = 0; D < size<4>(pKgK); D++) {
+         CUTLASS_PRAGMA_UNROLL
+         for (int K = 0; K < Stages; K++) {
+@@ -290,6 +364,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
+ 
+       /* V prefetch for GEMM 2 */
+       prefetch(prefetch_v, pVgV(_,_,_,K));
++      // prefetch one row of V, (128, 64)
+ 
+       /* Causal masking */
+       if constexpr (CausalMask) {
+diff --git a/applications/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp b/applications/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp
+index f5905f74..074ebd54 100644
+--- a/applications/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp
++++ b/applications/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp
+@@ -194,16 +194,22 @@ public:
+     int head_group_q = s.num_heads_q / s.num_heads_kv;
+ 
+     int thr_id = int(ThreadIdxX());
++
++    // causal mask related
+     int sub_group_id = thr_id / intel::sg_size;
+     int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
++    // 8
+ 
+     auto cS = make_identity_tensor(take<0,2>(TiledMMAQK{}.tile_mnk()));
++    // ArithTuple(_0,_0) o (_128,_64):(_1@0,_1@1)
+     auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
++    // ArithTuple(0,0) o (_8,_1,_4):(_1@0,_0,_16@1)
+     auto q_offset_wi = get<0>(tScS(0));
+     auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
++    // end of causal mask related
+ 
+     TileScheduler tile_scheduler{params.scheduler};
+-
++    // if not persistent, each wg process one tile, ignore this for loop
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+       auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.get_block_coord(); // (Q,V,h,b)
+@@ -214,6 +220,7 @@ public:
+       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
+       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
+ 
++      // causal mask related
+       auto offset = cute::min(seq_len_qo, seq_len_kv);
+       auto discard_seq_coord = seq_len_qo - offset;
+       auto full_tile_offset = seq_len_kv - offset;
+@@ -222,7 +229,7 @@ public:
+       if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
+       const int seq_len = CollectiveMainloop::CausalMask ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) + q_sg_tile : seq_len_kv;
+       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+-
++      // if not causal, k_blocks = cute::ceil_div(s.seq_len_kv, get<1>(TileShapeQK{}));
+       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+       if constexpr (is_var_len) {
+         int group_heads_q = s.num_heads_q / s.num_heads_kv;
+@@ -240,6 +247,7 @@ public:
+       auto shape_V = make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
+       auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_kv, batch_dim);
+ 
++      // if not varlen, offset = 0
+       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+       auto dcK = const_cast<ElementK*>(p.K + offset_k);
+       auto dcV = const_cast<ElementV*>(p.V + offset_v);
+@@ -258,7 +266,10 @@ public:
+ 
+       // O accumulator types
+       FragA tArA;
+-      FragARow tA_max, tA_sum;
++      // SubgroupTensor
++      //   Tensor:           ptr[32b](0x2000000000000200) o (_8,_1,_2,_4):(_1,_0,_8,_16)
++      //   SubgroupTVLayout: (_16,(_8,(_1,_2),_4)):(_1@1,(_1@0,(_0,_16@1),_32@1))
++      FragARow tA_max, tA_sum; // ptr[32b](0x2000000000000000) o _1:_0
+ 
+       // Main loop
+       int l_coord = is_var_len ? 0 : idx_b;

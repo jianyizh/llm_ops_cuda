@@ -38,7 +38,7 @@ using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
 template <class kernel>
-class legacy_kernel;
+class legacy_fmha_kernel;
 
 template <bool Causal,
           typename TileShapeQK,
@@ -156,9 +156,9 @@ cutlass::Status cute_example_mha(
       sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
   };
   compat::experimental::kernel_properties kernel_props{
-      sycl::ext::oneapi::experimental::sub_group_size<FMHAPrefillKernel::DispatchPolicy::SubgroupSize>};
+      sycl::ext::oneapi::experimental::sub_group_size<FMHAPrefillKernel::DispatchPolicy::SubgroupSize>, sycl::ext::intel::experimental::grf_size<256>};
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, legacy_kernel<FMHAPrefillKernel>>(policy, queue, params);
+  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, legacy_fmha_kernel<FMHAPrefillKernel>>(policy, queue, params);
 
   return cutlass::Status::kSuccess;
 }
@@ -197,15 +197,15 @@ void cute_example_legacy(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, t
     using SubgroupLayout = Layout<Shape<_8, _1, _1>, Stride<_1, _1, _1>>;
     constexpr int PipelineStages = 2;
     result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(k.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(v.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(out.data_ptr()),
-                                                                                                                    batch_size,
-                                                                                                                    seqlen_q,
-                                                                                                                    num_head,
-                                                                                                                    head_dim,
-                                                                                                                    seqlen_k,
-                                                                                                                    q.device());
+                                                                                                               reinterpret_cast<cute::half_t *>(k.data_ptr()),
+                                                                                                               reinterpret_cast<cute::half_t *>(v.data_ptr()),
+                                                                                                               reinterpret_cast<cute::half_t *>(out.data_ptr()),
+                                                                                                               batch_size,
+                                                                                                               seqlen_q,
+                                                                                                               num_head,
+                                                                                                               head_dim,
+                                                                                                               seqlen_k,
+                                                                                                               q.device());
   }
   else if (head_dim == 128)
   {
@@ -215,15 +215,15 @@ void cute_example_legacy(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, t
     using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
     constexpr int PipelineStages = 2;
     result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(k.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(v.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(out.data_ptr()),
-                                                                                                                    batch_size,
-                                                                                                                    seqlen_q,
-                                                                                                                    num_head,
-                                                                                                                    head_dim,
-                                                                                                                    seqlen_k,
-                                                                                                                    q.device());
+                                                                                                               reinterpret_cast<cute::half_t *>(k.data_ptr()),
+                                                                                                               reinterpret_cast<cute::half_t *>(v.data_ptr()),
+                                                                                                               reinterpret_cast<cute::half_t *>(out.data_ptr()),
+                                                                                                               batch_size,
+                                                                                                               seqlen_q,
+                                                                                                               num_head,
+                                                                                                               head_dim,
+                                                                                                               seqlen_k,
+                                                                                                               q.device());
   }
   else if (head_dim == 192)
   {
@@ -233,15 +233,15 @@ void cute_example_legacy(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, t
     using SubgroupLayout = Layout<Shape<_32, _1, _1>, Stride<_1, _1, _1>>;
     constexpr int PipelineStages = 2;
     result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(k.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(v.data_ptr()),
-                                                                                                                    reinterpret_cast<cute::half_t *>(out.data_ptr()),
-                                                                                                                    batch_size,
-                                                                                                                    seqlen_q,
-                                                                                                                    num_head,
-                                                                                                                    head_dim,
-                                                                                                                    seqlen_k,
-                                                                                                                    q.device());
+                                                                                                               reinterpret_cast<cute::half_t *>(k.data_ptr()),
+                                                                                                               reinterpret_cast<cute::half_t *>(v.data_ptr()),
+                                                                                                               reinterpret_cast<cute::half_t *>(out.data_ptr()),
+                                                                                                               batch_size,
+                                                                                                               seqlen_q,
+                                                                                                               num_head,
+                                                                                                               head_dim,
+                                                                                                               seqlen_k,
+                                                                                                               q.device());
   }
   else
   {
