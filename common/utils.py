@@ -72,3 +72,22 @@ def run_benchmark(
     if show_all:
         print(out)
     return out.clone(), mean_time
+
+def get_mha_tflops(
+    batch: int, num_heads_q: int, seq_len_qo: int, head_size_qk: int, num_heads_kv: int, seq_len_kv: int, head_size_vo: int, secs: float = 1.0):
+    flops_qk = 2.0 * batch * num_heads_q * seq_len_qo * seq_len_kv * head_size_qk
+    flops_pv = 2.0 * batch * num_heads_q * seq_len_qo * head_size_vo * seq_len_kv
+    tflops = ((flops_qk + flops_pv) * 1e-12) / secs
+    element_size_bytes = 2
+    gbps_qk = batch * (
+        element_size_bytes * num_heads_q * seq_len_qo * head_size_qk +
+        element_size_bytes * num_heads_kv * seq_len_kv * head_size_qk
+    )
+    gbps_pv = (
+        element_size_bytes * batch * num_heads_kv * seq_len_kv * head_size_vo +
+        element_size_bytes * batch * num_heads_q *seq_len_qo * head_size_vo
+    )
+    gbps = ((gbps_qk + gbps_pv) * 1e-9) / secs
+
+
+    return tflops, gbps

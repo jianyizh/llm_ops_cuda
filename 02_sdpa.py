@@ -1,6 +1,6 @@
 
 import torch
-from common.utils import run_benchmark, common_cuda_flags, common_sycl_flags
+from common.utils import run_benchmark, common_cuda_flags, common_sycl_flags, get_mha_tflops
 from torch.utils.cpp_extension import load
 from functools import partial
 import os
@@ -75,14 +75,20 @@ if __name__ == "__main__":
                             ).xpu().half().contiguous()
             output = torch.zeros(
                 (batch, num_heads, seq_len, head_dim)).xpu().half().contiguous()
-            output, _ = run_benchmark(
+            output, mean_time = run_benchmark(
                 torch.nn.functional.scaled_dot_product_attention, q, k, v, tag="f16_torch")
+            tflops, gbps = get_mha_tflops(batch, num_heads, seq_len, head_dim, num_heads, seq_len, head_dim, mean_time / 1000)
+            print(f"f16_torch tflops: {tflops:.2f}, gbps: {gbps:.2f}")
             output_torch = output.cpu()
-            output, _ = run_benchmark(
+            output, mean_time = run_benchmark(
                 lib.cute_example_legacy, q, k, v, out=output, tag="f16_cute_legacy_xpu")
+            tflops, gbps = get_mha_tflops(batch, num_heads, seq_len, head_dim, num_heads, seq_len, head_dim, mean_time / 1000)
+            print(f"f16_cute_legacy_xpu tflops: {tflops:.2f}, gbps: {gbps:.2f}")
             output_legacy = output.cpu()
-            output, _ = run_benchmark(
+            output, mean_time = run_benchmark(
                 lib.cute_example_xe, q, k, v, out=output, tag="f16_cute_xpu")
+            tflops, gbps = get_mha_tflops(batch, num_heads, seq_len, head_dim, num_heads, seq_len, head_dim, mean_time / 1000)
+            print(f"f16_cute_xpu tflops: {tflops:.2f}, gbps: {gbps:.2f}")
             output_xe = output.cpu()
             print((output_torch - output_legacy).abs().max())
             print((output_torch - output_xe).abs().max())

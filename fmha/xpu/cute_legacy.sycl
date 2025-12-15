@@ -37,10 +37,11 @@ using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
-template <class kernel>
+template <int head_dim>
 class legacy_fmha_kernel;
 
-template <bool Causal,
+template <int kernel_name,
+          bool Causal,
           typename TileShapeQK,
           typename TileShapePV,
           typename TileShapeOutput,
@@ -158,7 +159,7 @@ cutlass::Status cute_example_mha(
   compat::experimental::kernel_properties kernel_props{
       sycl::ext::oneapi::experimental::sub_group_size<FMHAPrefillKernel::DispatchPolicy::SubgroupSize>, sycl::ext::intel::experimental::grf_size<256>};
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, legacy_fmha_kernel<FMHAPrefillKernel>>(policy, queue, params);
+  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, legacy_fmha_kernel<kernel_name>>(policy, queue, params);
 
   return cutlass::Status::kSuccess;
 }
@@ -178,7 +179,7 @@ void cute_example_legacy(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, t
     using ShapeOutPut = Shape<_128, _64, _64>;
     using SubgroupLayout = Layout<Shape<_8, _1, _1>, Stride<_1, _1, _1>>;
     constexpr int PipelineStages = 2;
-    result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
+    result = cute_example_mha<64, /*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(k.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(v.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(out.data_ptr()),
@@ -196,7 +197,7 @@ void cute_example_legacy(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, t
     using ShapeOutPut = Shape<_128, _96, _64>;
     using SubgroupLayout = Layout<Shape<_8, _1, _1>, Stride<_1, _1, _1>>;
     constexpr int PipelineStages = 2;
-    result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
+    result = cute_example_mha<96, /*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(k.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(v.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(out.data_ptr()),
@@ -214,7 +215,7 @@ void cute_example_legacy(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, t
     using ShapeOutPut = Shape<_128, _128, _64>;
     using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
     constexpr int PipelineStages = 2;
-    result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
+    result = cute_example_mha<128, /*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(k.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(v.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(out.data_ptr()),
@@ -232,7 +233,7 @@ void cute_example_legacy(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, t
     using ShapeOutPut = Shape<_256, _192, _64>;
     using SubgroupLayout = Layout<Shape<_32, _1, _1>, Stride<_1, _1, _1>>;
     constexpr int PipelineStages = 2;
-    result = cute_example_mha</*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
+    result = cute_example_mha<192, /*causal=*/false, ShapeQK, ShapePV, ShapeOutPut, SubgroupLayout, PipelineStages>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(k.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(v.data_ptr()),
                                                                                                                reinterpret_cast<cute::half_t *>(out.data_ptr()),
