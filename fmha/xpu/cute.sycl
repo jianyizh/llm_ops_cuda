@@ -8,7 +8,7 @@
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include "cutlass/util/packed_stride.hpp"
 #include "flash_attention_v2/collective/fmha_fusion.hpp"
-#include "flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
+#include "flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include <cute/tensor.hpp>
@@ -31,10 +31,6 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 using namespace cute;
-using LayoutQ = cutlass::layout::RowMajor;
-using LayoutK = cutlass::layout::ColumnMajor;
-using LayoutV = cutlass::layout::RowMajor;
-using LayoutO = cutlass::layout::RowMajor;
 
 template <int head_dim>
 class xe_fmha_kernel;
@@ -132,14 +128,19 @@ cutlass::Status cute_example_mha(
   using TensorK = decltype(make_dummy_tensor(ElementK{}, StrideK{}));
   using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
   using TensorO = decltype(make_dummy_tensor(ElementO{}, StrideO{}));
+  using TensorK_cache = TensorK;
+  using TensorV_cache = TensorV;
+  using GmemTiledCopyK_cache = GmemTiledCopyK;
+  using GmemTiledCopyV_cache = GmemTiledCopyV;
 
   // Mainloop
   using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
   using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
-      MainloopDispatchPolicy, Causal,
+      MainloopDispatchPolicy, Causal, false /* CachedKV*/, false /* PagedKV*/,
       TiledMMAQK, TiledMMAPV, VTiles,
-      TensorQ, TensorK, TensorV,
-      GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV>;
+      TensorQ, TensorK, TensorV, TensorK_cache, TensorV_cache,
+      GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV,
+      GmemTiledCopyK_cache, GmemTiledCopyV_cache>;
 
   // Epilogue
   using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
@@ -162,17 +163,29 @@ cutlass::Status cute_example_mha(
   shape.num_heads_kv = num_head;
   shape.seq_len_qo = seqlen_q;
   shape.seq_len_kv = seqlen_k;
+  shape.seq_len_kv_cache = 0;
   shape.head_size_qk = head_dim;
   shape.head_size_vo = head_dim;
   StrideQ stride_Q = cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(shape.seq_len_qo, shape.head_size_qk, shape.num_heads_q, shape.batch));
   StrideK stride_K = cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(shape.seq_len_kv, shape.head_size_qk, shape.num_heads_kv, shape.batch));
   StrideV stride_V = cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(shape.head_size_vo, shape.seq_len_kv, shape.num_heads_kv, shape.batch));
   StrideO stride_O = cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(shape.seq_len_qo, shape.head_size_vo, shape.num_heads_q, shape.batch));
+  StrideK stride_K_cache = stride_K;
+  StrideV stride_V_cache = stride_V;
+
   // equivalent to contiguous (batch, num_heads, seqlen_q, head_dim)
   typename FMHAKernel::Arguments arguments{
       {shape,
-       q, stride_Q, k, stride_K, v, stride_V, out, stride_O},
-      {1 / sqrt(static_cast<float>(shape.head_size_qk))},
+       q, stride_Q, 
+       k, stride_K, 
+       v, stride_V, 
+       out, stride_O,
+       nullptr, stride_K_cache /* K_cache*/,
+       nullptr, stride_V_cache /* V_cache*/},
+      {1 / sqrt(static_cast<float>(shape.head_size_qk)),
+       nullptr,
+       0,
+       nullptr},
       {},
       hw_info};
 
@@ -268,9 +281,9 @@ void cute_example_xe(torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, torch
   }
   else if (head_dim == 128)
   {
-    using ShapeQK = Shape<_128, _64, _32>;
-    using ShapePV = Shape<_128, _32, _64>;
-    using ShapeOut = Shape<_128, _128>;
+    using ShapeQK = Shape<_256, _32 , _32>;
+    using ShapePV = Shape<_256, _32, _32>;
+    using ShapeOut = Shape<_256, _128>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>; // 16 subgroups on m
     result = cute_example_mha<128, /*causal*/ false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK, void, PipelineStages, /*persistent=*/false, cute::half_t, cute::half_t, cute::half_t>(reinterpret_cast<cute::half_t *>(q.data_ptr()),
                                                                                                                                                                                     reinterpret_cast<cute::half_t *>(k.data_ptr()),
